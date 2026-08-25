@@ -30,6 +30,56 @@ ALLOWED_CONTENT_TYPES = ("application/json", "text/plain")
 DEFAULT_JWT_PAYLOAD = {"sub": "admin", "user": "admin", "role": "admin", "admin": True}
 ALG_NONE_CASES = ("none", "None", "NONE")  # некоторые парсеры сравнивают alg регистрозависимо
 
+# Тривиальные тела ответа вида health-check (OK/HEALTHY/PONG и т.п.) - такие ответы
+# считаются false positive: сервер вернул generic health-check, а не реальные данные
+DEFAULT_TRIVIAL_BODY_VALUES = {
+    "ok", "healthy", "true", "success", "pong", "up", "alive", "yes", "1", "0",
+    "null", "none", "ready", "running", "active", "pass", "passed", "green",
+}
+HEALTH_LIKE_JSON_KEYS = {"status", "health", "state", "result", "message"}
+
+
+def is_trivial_response(content: bytes, extra_trivial_values: Optional[set] = None) -> bool:
+    """Определяет, является ли тело ответа тривиальным health-check ответом
+    (просто 'OK'/'HEALTHY' и т.п.), а не реальными данными - чтобы отсеять false positive."""
+    trivial_values = DEFAULT_TRIVIAL_BODY_VALUES | (extra_trivial_values or set())
+
+    try:
+        text = content.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return False
+
+    if not text:
+        return False
+
+    # Простое текстовое тело: "OK", "healthy", "PONG" и т.п. (с возможными кавычками вокруг)
+    bare = text.strip("\"' \t\n").lower()
+    if bare in trivial_values:
+        return True
+
+    # JSON-обёртка вида {"status": "ok"} / {"health": "OK", "message": "healthy"}
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    if isinstance(data, dict) and 1 <= len(data) <= 3:
+        keys_lower = {k.lower() for k in data.keys()}
+        if keys_lower & HEALTH_LIKE_JSON_KEYS:
+            values_trivial = True
+            for v in data.values():
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, str) and v.strip("\"' \t\n").lower() in trivial_values:
+                    continue
+                values_trivial = False
+                break
+            if values_trivial:
+                return True
+
+    return False
+
+
 # Шаблон claims в стиле Azure AD B2C токена - используется с --jwt-azure-b2c,
 # чтобы подделанный токен по структуре был похож на настоящий B2C-токен
 AZURE_B2C_DEFAULT_PAYLOAD = {
@@ -195,6 +245,7 @@ class JwtCheck:
     curl_poc: Optional[str] = None
     is_control: bool = False  # True = негативный контроль (garbage-подпись), не считается forged-успехом
     identity: Optional[str] = None  # метка личности, от имени которой подделан токен (batch-режим --jwt-identities)
+    is_trivial_body: bool = False  # True = тело похоже на health-check (OK/HEALTHY) - исключено из accepted как false positive
 
 
 def build_curl_poc(url: str, delivery: str, token: str, header_name: str, cookie_name: str) -> str:
@@ -207,7 +258,9 @@ def build_curl_poc(url: str, delivery: str, token: str, header_name: str, cookie
 def run_jwt_checks(url: str, timeout: int, verify_ssl: bool, base_headers: dict,
                     secret: str, jwt_payload: dict, jwt_header_name: str,
                     jwt_cookie_name: str, rsa_pubkey_pem: Optional[bytes] = None,
-                    identity: Optional[str] = None) -> list["JwtCheck"]:
+                    identity: Optional[str] = None,
+                    ignore_trivial_body: bool = True,
+                    extra_trivial_values: Optional[set] = None) -> list["JwtCheck"]:
     checks = []
 
     tokens = {
@@ -249,22 +302,28 @@ def run_jwt_checks(url: str, timeout: int, verify_ssl: bool, base_headers: dict,
 
             content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
             body_size = len(resp.content)
-            accepted = (resp.status_code == 200 and content_type in ALLOWED_CONTENT_TYPES and body_size > 0)
+            trivial = ignore_trivial_body and is_trivial_response(resp.content, extra_trivial_values)
+            accepted = (resp.status_code == 200 and content_type in ALLOWED_CONTENT_TYPES
+                        and body_size > 0 and not trivial)
 
             checks.append(JwtCheck(
                 kind=kind, delivery=mode_name, token=token, status_code=resp.status_code,
                 content_type=content_type, body_size=body_size, accepted=accepted, is_control=is_control,
                 curl_poc=build_curl_poc(url, mode_name, token, jwt_header_name, jwt_cookie_name),
-                identity=identity,
+                identity=identity, is_trivial_body=trivial,
             ))
 
     return checks
 
 
+
+
 def run_jwt_checks_multi_identity(url: str, timeout: int, verify_ssl: bool, base_headers: dict,
                                    secret: str, base_payload: dict, identities: list[dict],
                                    jwt_header_name: str, jwt_cookie_name: str,
-                                   rsa_pubkey_pem: Optional[bytes] = None) -> list["JwtCheck"]:
+                                   rsa_pubkey_pem: Optional[bytes] = None,
+                                   ignore_trivial_body: bool = True,
+                                   extra_trivial_values: Optional[set] = None) -> list["JwtCheck"]:
     """Прогоняет полный набор JWT-подделок отдельно для каждой 'личности' из --jwt-identities,
     мержа её claims поверх base_payload. Позволяет проверить, можно ли подделать
     сессию под конкретных известных пользователей (session hijack / impersonation),
@@ -276,6 +335,7 @@ def run_jwt_checks_multi_identity(url: str, timeout: int, verify_ssl: bool, base
         checks = run_jwt_checks(
             url, timeout, verify_ssl, base_headers, secret, merged_payload,
             jwt_header_name, jwt_cookie_name, rsa_pubkey_pem, identity=label,
+            ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
         )
         all_checks.extend(checks)
     return all_checks
@@ -352,7 +412,9 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
                   jwt_payload: Optional[dict] = None, jwt_header_name: str = "Authorization",
                   jwt_cookie_name: str = "access_token",
                   jwt_rsa_pubkey_pem: Optional[bytes] = None,
-                  jwt_identities: Optional[list] = None) -> CheckResult:
+                  jwt_identities: Optional[list] = None,
+                  ignore_trivial_body: bool = True,
+                  extra_trivial_values: Optional[set] = None) -> CheckResult:
     try:
         resp = requests.request(
             method,
@@ -370,7 +432,9 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
     # Content-Type может содержать charset, например: application/json; charset=utf-8
     content_type = content_type_raw.split(";")[0].strip().lower()
     body_size = len(resp.content)
-    baseline_ok = (status_code == 200 and content_type in ALLOWED_CONTENT_TYPES and body_size > 0)
+    trivial_body = ignore_trivial_body and is_trivial_response(resp.content, extra_trivial_values)
+    baseline_ok = (status_code == 200 and content_type in ALLOWED_CONTENT_TYPES
+                   and body_size > 0 and not trivial_body)
 
     jwt_checks = []
     jwt_verdict = None
@@ -380,12 +444,14 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
                 url, timeout, verify_ssl, headers, jwt_secret,
                 jwt_payload or DEFAULT_JWT_PAYLOAD, jwt_identities,
                 jwt_header_name, jwt_cookie_name, rsa_pubkey_pem=jwt_rsa_pubkey_pem,
+                ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
             )
         else:
             jwt_checks = run_jwt_checks(
                 url, timeout, verify_ssl, headers, jwt_secret,
                 jwt_payload or DEFAULT_JWT_PAYLOAD, jwt_header_name, jwt_cookie_name,
                 rsa_pubkey_pem=jwt_rsa_pubkey_pem,
+                ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
             )
         jwt_verdict = classify_jwt_verdict(baseline_ok, jwt_checks)
 
@@ -411,6 +477,14 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
             reason="тело ответа пустое (0 байт)", jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
         )
 
+    if trivial_body:
+        return CheckResult(
+            url=url, ok=False, status_code=status_code,
+            content_type=content_type, body_size=body_size,
+            reason="тело похоже на health-check ответ (OK/HEALTHY и т.п.) - вероятный false positive",
+            jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+        )
+
     return CheckResult(
         url=url, ok=True, status_code=status_code,
         content_type=content_type, body_size=body_size, jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
@@ -428,6 +502,10 @@ def main():
     parser.add_argument("--no-verify-ssl", action="store_true", help="Отключить проверку SSL сертификатов")
     parser.add_argument("--header", action="append", default=[], help="Дополнительный заголовок вида 'Key: Value' (можно указывать несколько раз)")
     parser.add_argument("--fail-only", action="store_true", help="Выводить в консоль только неуспешные проверки")
+    parser.add_argument("--allow-trivial-bodies", action="store_true",
+                         help="Не отсеивать тривиальные health-check ответы (OK/HEALTHY/PONG и т.п.) - по умолчанию они считаются false positive и не засчитываются")
+    parser.add_argument("--ignore-body-value", action="append", default=[], metavar="VALUE",
+                         help="Дополнительное тривиальное значение тела ответа для фильтрации как false positive (можно указывать несколько раз), например --ignore-body-value alive")
 
     jwt_group = parser.add_argument_group("JWT-тестирование (только для авторизованных проверок собственных таргетов)")
     jwt_group.add_argument("--jwt-test", action="store_true", help="Проверить bypass через JWT: слабый секрет (HS256 'secret'), alg=none (в т.ч. регистровые варианты и пустой payload), плюс негативный контроль (мусорная подпись) для отсева ложных срабатываний")
@@ -491,6 +569,11 @@ def main():
             print(f"[!] Не удалось загрузить --jwt-rsa-pubkey: {e}", file=sys.stderr)
             sys.exit(1)
 
+    ignore_trivial_body = not args.allow_trivial_bodies
+    extra_trivial_values = {v.strip().lower() for v in args.ignore_body_value} if args.ignore_body_value else None
+    if not ignore_trivial_body:
+        print("[*] Фильтрация тривиальных health-check ответов (OK/HEALTHY) ОТКЛЮЧЕНА (--allow-trivial-bodies)")
+
     targets = read_targets(args.file)
     if not targets:
         print("[!] Список таргетов пуст.", file=sys.stderr)
@@ -510,7 +593,7 @@ def main():
             executor.submit(
                 check_target, url, args.timeout, args.method, not args.no_verify_ssl, headers,
                 args.jwt_test, args.jwt_secret, jwt_payload, args.jwt_header_name, args.jwt_cookie_name,
-                jwt_rsa_pubkey_pem, jwt_identities,
+                jwt_rsa_pubkey_pem, jwt_identities, ignore_trivial_body, extra_trivial_values,
             ): url
             for url in targets
         }
@@ -539,7 +622,8 @@ def main():
                     print(f"       └─ {tag} JWT[{label}]: status={jc.status_code} type={jc.content_type} size={jc.body_size}B")
                     print(f"          PoC: {jc.curl_poc}")
                 else:
-                    print(f"       └─ JWT[{label}] отклонён: status={jc.status_code} type={jc.content_type} size={jc.body_size}B")
+                    reason = " (health-check-подобное тело, false positive отфильтрован)" if jc.is_trivial_body else ""
+                    print(f"       └─ JWT[{label}] отклонён: status={jc.status_code} type={jc.content_type} size={jc.body_size}B{reason}")
 
             if result.jwt_verdict:
                 verdict_labels = {
