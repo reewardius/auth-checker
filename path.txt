@@ -14,8 +14,5 @@ api/v1/config
 api/debug
 api/orders
 api/v1/orders
-api/orders/me
-api/payments
-api/v1/payments
 api/customer
 api/customers
