@@ -20,11 +20,15 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass, asdict, field
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -35,6 +39,50 @@ except ImportError:
 
 ALLOWED_CONTENT_TYPES = ("application/json", "text/plain")
 ALG_NONE_CASES = ("none", "None", "NONE")  # некоторые парсеры сравнивают alg регистрозависимо
+
+
+# ---------------------------------------------------------------------------
+# DNS-кэш: если хост изначально не резолвится (внутренний домен, опечатка,
+# мёртвый CNAME и т.п.), нет смысла на КАЖДЫЙ отдельный запрос (baseline +
+# все JWT-варианты + все CVE-payload'ы + все 9 proxy-bypass payload'ов -
+# это могут быть сотни попыток на один и тот же хост) заново идти в DNS и
+# ждать таймаут резолвера. Резолвим каждый хост максимум один раз за прогон
+# (с кэшем, потокобезопасно) и дальше мгновенно фейлим все запросы к нему.
+_dns_cache: dict = {}
+_dns_cache_lock = threading.Lock()
+
+
+def _host_resolves(hostname: str) -> bool:
+    with _dns_cache_lock:
+        cached = _dns_cache.get(hostname)
+    if cached is not None:
+        return cached
+    try:
+        socket.getaddrinfo(hostname, None)
+        resolved = True
+    except socket.gaierror:
+        resolved = False
+    with _dns_cache_lock:
+        _dns_cache[hostname] = resolved
+    return resolved
+
+
+def safe_get(url: str, **kwargs):
+    """Обёртка над requests.get, которая сначала (с кэшем) проверяет, резолвится
+    ли хост из url - если нет, сразу поднимает requests.exceptions.ConnectionError
+    без реальной попытки соединения/DNS-таймаута, что позволяет существующим
+    `except requests.exceptions.RequestException` веткам работать без изменений."""
+    return safe_request("GET", url, **kwargs)
+
+
+def safe_request(method: str, url: str, **kwargs):
+    """То же самое, что safe_get, но для произвольного HTTP-метода (requests.request)."""
+    hostname = urlparse(url).hostname
+    if hostname and not _host_resolves(hostname):
+        raise requests.exceptions.ConnectionError(
+            f"Хост не резолвится (закэшировано, запрос пропущен): {hostname}"
+        )
+    return requests.request(method, url, **kwargs)
 
 
 def default_jwt_payload() -> dict:
@@ -337,8 +385,8 @@ def run_jwt_checks(url: str, timeout: int, verify_ssl: bool, base_headers: dict,
                     cookies[c_name] = c_val_tpl.format(token=token)
 
             try:
-                resp = requests.get(url, timeout=timeout, verify=verify_ssl,
-                                     headers=headers, cookies=cookies, allow_redirects=True)
+                resp = safe_get(url, timeout=timeout, verify=verify_ssl,
+                                 headers=headers, cookies=cookies, allow_redirects=False)
             except requests.exceptions.RequestException as e:
                 checks.append(JwtCheck(kind=kind, delivery=mode_name, token=token, error=str(e),
                                         is_control=is_control, identity=identity))
@@ -449,8 +497,8 @@ def check_cve_2025_29927(url: str, timeout: int, verify_ssl: bool, base_headers:
         headers[NEXTJS_MIDDLEWARE_BYPASS_HEADER] = payload
 
         try:
-            resp = requests.get(url, timeout=timeout, verify=verify_ssl,
-                                 headers=headers, allow_redirects=True)
+            resp = safe_get(url, timeout=timeout, verify=verify_ssl,
+                             headers=headers, allow_redirects=False)
         except requests.exceptions.RequestException as e:
             checks.append(CveCheck(cve_id="CVE-2025-29927", payload=payload, error=str(e)))
             continue
@@ -557,6 +605,133 @@ class ProxyBypassCheck:
     error: Optional[str] = None
     curl_poc: Optional[str] = None
     is_trivial_body: bool = False
+    severity: Optional[str] = None  # LOW/MEDIUM/HIGH, считается только для accepted=True
+    sensitive_indicators: list = field(default_factory=list)  # какие именно паттерны сработали
+
+
+# ---------------------------------------------------------------------------
+# Severity-классификация тела ответа для confirmed proxy-bypass находок.
+#
+# Логика (по мотивам примера из реального отчёта): сам обход авторизации -
+# это уже находка сама по себе, но её критичность сильно зависит от того, ЧТО
+# именно утекло через bypass:
+#   - HIGH   - в ответе есть явные credentials/секреты (пароли, токены, API-ключи,
+#              номера карт прошедшие Luhn-проверку, IBAN, JWT-подобные строки)
+#   - MEDIUM - в ответе есть PII-подобные поля (email, телефон, адрес, ФИО и т.п.),
+#              либо структура ответа неизвестна/бинарна, но обход подтверждён -
+#              MEDIUM это severity по умолчанию для любого confirmed bypass
+#   - LOW    - ответ пустой/health-check-подобный (см. is_trivial_response) ИЛИ
+#              не содержит распознанных чувствительных полей/паттернов - обход
+#              подтверждён технически, но утечка данных не подтверждена
+# Это простая эвристика по ключам/паттернам, не замена ручному ревью ответа.
+HIGH_SEVERITY_KEY_SUBSTRINGS = (
+    "password", "passwd", "secret", "client_secret", "api_key", "apikey",
+    "access_token", "refresh_token", "auth_token", "bearer_token", "private_key",
+    "ssn", "social_security", "credit_card", "card_number", "cardnumber", "cvv",
+    "cvc", "iban", "bank_account", "routing_number", "passport", "national_id", "pin_code",
+)
+MEDIUM_SEVERITY_KEY_SUBSTRINGS = (
+    "email", "phone", "mobile", "address", "date_of_birth", "birthdate", "dob",
+    "full_name", "first_name", "last_name", "salary", "income", "tax_id",
+    "ip_address", "location", "gps",
+)
+
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+_JWT_LIKE_RE = re.compile(r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}')
+_IBAN_RE = re.compile(r'\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b')
+_CARD_CANDIDATE_RE = re.compile(r'\b(?:\d[ -]?){13,19}\b')
+
+SEVERITY_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Проверка контрольной суммы Луна - отсекает случайные 13-19-значные числа
+    (timestamp'ы, ID и т.п.), которые по длине похожи на номер карты, но им не являются."""
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        n = int(ch)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
+def _contains_valid_card_number(text: str) -> bool:
+    for m in _CARD_CANDIDATE_RE.finditer(text):
+        digits = re.sub(r'[ -]', '', m.group(0))
+        if 13 <= len(digits) <= 19 and _luhn_valid(digits):
+            return True
+    return False
+
+
+def _scan_json_keys(node, high_hits: set, medium_hits: set, _depth: int = 0):
+    if _depth > 8:  # защита от глубокой/циклической вложенности
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            kl = str(k).lower()
+            if any(sub in kl for sub in HIGH_SEVERITY_KEY_SUBSTRINGS):
+                high_hits.add(f"key:{kl}")
+            elif any(sub in kl for sub in MEDIUM_SEVERITY_KEY_SUBSTRINGS):
+                medium_hits.add(f"key:{kl}")
+            _scan_json_keys(v, high_hits, medium_hits, _depth + 1)
+    elif isinstance(node, list):
+        for item in node:
+            _scan_json_keys(item, high_hits, medium_hits, _depth + 1)
+
+
+def classify_body_severity(content: bytes) -> tuple[str, list]:
+    """Возвращает (severity, indicators) для тела ПОДТВЕРЖДЁННОГО bypass-ответа.
+    indicators - список сработавших признаков (ключи/паттерны), для прозрачности,
+    почему присвоена именно такая оценка."""
+    try:
+        text = content.decode("utf-8", errors="ignore")
+    except Exception:
+        return "MEDIUM", ["undecodable-binary-body"]
+
+    if not text.strip():
+        return "LOW", []
+
+    high_hits: set = set()
+    medium_hits: set = set()
+
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        data = None
+    if data is not None:
+        _scan_json_keys(data, high_hits, medium_hits)
+
+    if _EMAIL_RE.search(text):
+        medium_hits.add("pattern:email")
+    if _JWT_LIKE_RE.search(text):
+        high_hits.add("pattern:jwt-like-token")
+    if _IBAN_RE.search(text):
+        high_hits.add("pattern:iban")
+    if _contains_valid_card_number(text):
+        high_hits.add("pattern:card-number(luhn-valid)")
+
+    if high_hits:
+        severity = "HIGH"
+    elif medium_hits:
+        severity = "MEDIUM"
+    else:
+        severity = "LOW"  # bypass подтверждён, но явно чувствительных данных в теле не найдено
+
+    return severity, sorted(high_hits | medium_hits)
+
+
+def aggregate_pair_severity(checks: list) -> tuple[Optional[str], list]:
+    """Сводит severity по всем accepted-чекам одной пары (direct_url, template)
+    в одну итоговую оценку - берётся наихудшая (наиболее критичная)."""
+    accepted = [c for c in checks if c.accepted and c.severity]
+    if not accepted:
+        return None, []
+    worst = max(accepted, key=lambda c: SEVERITY_ORDER.get(c.severity, 0))
+    all_indicators = sorted({ind for c in accepted for ind in c.sensitive_indicators})
+    return worst.severity, all_indicators
 
 
 def read_proxy_bypass_map(path: str) -> list[tuple[str, str]]:
@@ -607,7 +782,7 @@ def check_proxy_bypass_pair(direct_url: str, bypass_template: str, timeout: int,
     """
     baseline_status = None
     try:
-        resp = requests.get(direct_url, timeout=timeout, verify=verify_ssl, headers=headers, allow_redirects=True)
+        resp = safe_get(direct_url, timeout=timeout, verify=verify_ssl, headers=headers, allow_redirects=False)
         baseline_status = resp.status_code
         content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
         body_size = len(resp.content)
@@ -622,7 +797,7 @@ def check_proxy_bypass_pair(direct_url: str, bypass_template: str, timeout: int,
     for payload in PROXY_BYPASS_PAYLOADS:
         bypass_url = bypass_template.replace("{payload}", payload)
         try:
-            resp = requests.get(bypass_url, timeout=timeout, verify=verify_ssl, headers=headers, allow_redirects=True)
+            resp = safe_get(bypass_url, timeout=timeout, verify=verify_ssl, headers=headers, allow_redirects=False)
         except requests.exceptions.RequestException as e:
             checks.append(ProxyBypassCheck(payload=payload, direct_url=direct_url, bypass_url=bypass_url, error=str(e)))
             continue
@@ -633,11 +808,16 @@ def check_proxy_bypass_pair(direct_url: str, bypass_template: str, timeout: int,
         accepted = (resp.status_code == 200 and content_type in ALLOWED_CONTENT_TYPES
                     and body_size > 0 and not trivial)
 
+        severity, indicators = (None, [])
+        if accepted:
+            severity, indicators = classify_body_severity(resp.content)
+
         checks.append(ProxyBypassCheck(
             payload=payload, direct_url=direct_url, bypass_url=bypass_url,
             status_code=resp.status_code, content_type=content_type, body_size=body_size,
             accepted=accepted, is_trivial_body=trivial,
             curl_poc=f"curl -skL --path-as-is '{bypass_url}'",
+            severity=severity, sensitive_indicators=indicators,
         ))
 
     if baseline_ok:
@@ -709,13 +889,13 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
                   check_nextjs_cve: bool = False,
                   jwt_profiles: Optional[list] = None) -> CheckResult:
     try:
-        resp = requests.request(
+        resp = safe_request(
             method,
             url,
             timeout=timeout,
             verify=verify_ssl,
             headers=headers,
-            allow_redirects=True,
+            allow_redirects=False,
         )
     except requests.exceptions.RequestException as e:
         return CheckResult(url=url, ok=False, error=str(e))
@@ -870,6 +1050,8 @@ def write_results_incremental(output_path: str, results: list, targets: list, us
                     "baseline_ok": baseline_ok,
                     "baseline_status": baseline_status,
                     "verdict": verdict,
+                    "severity": aggregate_pair_severity(checks)[0],
+                    "sensitive_indicators": aggregate_pair_severity(checks)[1],
                     "checks": [asdict(c) for c in checks if c.accepted],
                 }
                 for direct_url, template, baseline_ok, baseline_status, verdict, checks in confirmed_proxy_bypass
@@ -949,6 +1131,12 @@ def main():
                               help="Путь к файлу с парами 'прямой_URL => шаблон_обхода' (по одной паре на строку), "
                                    "шаблон обязан содержать плейсхолдер {payload}. Пример: "
                                    "https://host/dev/api/v1/pdt/items?x=1 => https://host/dev/api/swagger/{payload}v1/pdt/items?x=1")
+    proxy_group.add_argument("--skip-baseline", action="store_true",
+                              help="Пропустить фазу 1 (baseline-проверка каждого target x path без обхода: "
+                                   "200/401/403 + опционально JWT/CVE) и сразу перейти к proxy-bypass. "
+                                   "Полезно, если нужен ЧИСТО обход через прокси-путь, без лишнего вывода "
+                                   "по прямым запросам к targets/paths (baseline всё равно считается отдельно "
+                                   "внутри самого proxy-bypass теста для каждой пары)")
 
     args = parser.parse_args()
 
@@ -1043,79 +1231,83 @@ def main():
     proxy_bypass_results = []  # список (direct_url, template, baseline_ok, baseline_status, verdict, checks)
 
     results: list[CheckResult] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-        future_to_url = {
-            executor.submit(
-                check_target, url, args.timeout, args.method, not args.no_verify_ssl, headers,
-                args.jwt_test, args.jwt_secret, jwt_payload, args.jwt_header_name, args.jwt_cookie_name,
-                jwt_rsa_pubkey_pem, jwt_identities, ignore_trivial_body, extra_trivial_values,
-                args.check_nextjs_cve, jwt_profiles,
-            ): url
-            for url in targets
-        }
-        completed = concurrent.futures.as_completed(future_to_url)
-        if args.tqdm:
-            completed = _tqdm(completed, total=len(future_to_url), desc="baseline/JWT/CVE", unit="url")
-        for future in completed:
-            result = future.result()
-            results.append(result)
-
-            if args.output:
-                write_results_incremental(args.output, results, targets, use_proxy_format, proxy_bypass_results)
-
+    if args.skip_baseline:
+        print("[i] --skip-baseline: фаза 1 (прямая baseline/JWT/CVE проверка targets/paths) пропущена, "
+              "сразу перехожу к proxy-bypass\n")
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            future_to_url = {
+                executor.submit(
+                    check_target, url, args.timeout, args.method, not args.no_verify_ssl, headers,
+                    args.jwt_test, args.jwt_secret, jwt_payload, args.jwt_header_name, args.jwt_cookie_name,
+                    jwt_rsa_pubkey_pem, jwt_identities, ignore_trivial_body, extra_trivial_values,
+                    args.check_nextjs_cve, jwt_profiles,
+                ): url
+                for url in targets
+            }
+            completed = concurrent.futures.as_completed(future_to_url)
             if args.tqdm:
-                continue
+                completed = _tqdm(completed, total=len(future_to_url), desc="baseline/JWT/CVE", unit="url")
+            for future in completed:
+                result = future.result()
+                results.append(result)
 
-            if args.fail_only and result.ok:
-                continue
+                if args.output:
+                    write_results_incremental(args.output, results, targets, use_proxy_format, proxy_bypass_results)
 
-            if result.ok:
-                print(f"[OK]   {result.url}  status={result.status_code} type={result.content_type} size={result.body_size}B")
-            elif result.error:
-                print(f"[ERR]  {result.url}  ошибка запроса: {result.error}")
-            else:
-                print(f"[FAIL] {result.url}  status={result.status_code} type={result.content_type} size={result.body_size}B — {result.reason}")
+                if args.tqdm:
+                    continue
 
-            for jc in result.jwt_checks:
-                label = f"{jc.kind}/{jc.delivery}"
-                if jc.identity:
-                    label = f"identity={jc.identity} {label}"
-                if jc.error:
-                    print(f"       └─ JWT[{label}] ошибка: {jc.error}")
-                elif jc.accepted:
-                    tag = "[КОНТРОЛЬ принят]" if jc.is_control else "[!!! forged принят]"
-                    print(f"       └─ {tag} JWT[{label}]: status={jc.status_code} type={jc.content_type} size={jc.body_size}B")
-                    print(f"          PoC: {jc.curl_poc}")
+                if args.fail_only and result.ok:
+                    continue
+
+                if result.ok:
+                    print(f"[OK]   {result.url}  status={result.status_code} type={result.content_type} size={result.body_size}B")
+                elif result.error:
+                    print(f"[ERR]  {result.url}  ошибка запроса: {result.error}")
                 else:
-                    reason = " (health-check-подобное тело, false positive отфильтрован)" if jc.is_trivial_body else ""
-                    print(f"       └─ JWT[{label}] отклонён: status={jc.status_code} type={jc.content_type} size={jc.body_size}B{reason}")
+                    print(f"[FAIL] {result.url}  status={result.status_code} type={result.content_type} size={result.body_size}B — {result.reason}")
 
-            if result.jwt_verdict:
-                verdict_labels = {
-                    "confirmed_vulnerable": "[!!! ПОДТВЕРЖДЕНО] сервер валидирует JWT, но принимает подделанный (слабый секрет / alg=none)",
-                    "signature_not_validated": "[!] подпись JWT вообще не проверяется (принят даже случайный мусор)",
-                    "no_auth_required": "[i] эндпоинт отдаёт 200 и без токена — авторизация не требуется вовсе",
-                    "protected": "[OK] все подделанные токены отклонены",
-                }
-                print(f"       └─ ВЕРДИКТ: {verdict_labels.get(result.jwt_verdict, result.jwt_verdict)}")
+                for jc in result.jwt_checks:
+                    label = f"{jc.kind}/{jc.delivery}"
+                    if jc.identity:
+                        label = f"identity={jc.identity} {label}"
+                    if jc.error:
+                        print(f"       └─ JWT[{label}] ошибка: {jc.error}")
+                    elif jc.accepted:
+                        tag = "[КОНТРОЛЬ принят]" if jc.is_control else "[!!! forged принят]"
+                        print(f"       └─ {tag} JWT[{label}]: status={jc.status_code} type={jc.content_type} size={jc.body_size}B")
+                        print(f"          PoC: {jc.curl_poc}")
+                    else:
+                        reason = " (health-check-подобное тело, false positive отфильтрован)" if jc.is_trivial_body else ""
+                        print(f"       └─ JWT[{label}] отклонён: status={jc.status_code} type={jc.content_type} size={jc.body_size}B{reason}")
 
-            for cc in result.nextjs_cve_checks:
-                if cc.error:
-                    print(f"       └─ CVE-2025-29927[{cc.payload}] ошибка: {cc.error}")
-                elif cc.accepted:
-                    print(f"       └─ [!!! BYPASS] CVE-2025-29927 x-middleware-subrequest='{cc.payload}': status={cc.status_code} type={cc.content_type} size={cc.body_size}B")
-                    print(f"          PoC: {cc.curl_poc}")
-                else:
-                    trivial_note = " (health-check-подобное тело)" if cc.is_trivial_body else ""
-                    print(f"       └─ CVE-2025-29927[{cc.payload}] отклонён: status={cc.status_code}{trivial_note}")
+                if result.jwt_verdict:
+                    verdict_labels = {
+                        "confirmed_vulnerable": "[!!! ПОДТВЕРЖДЕНО] сервер валидирует JWT, но принимает подделанный (слабый секрет / alg=none)",
+                        "signature_not_validated": "[!] подпись JWT вообще не проверяется (принят даже случайный мусор)",
+                        "no_auth_required": "[i] эндпоинт отдаёт 200 и без токена — авторизация не требуется вовсе",
+                        "protected": "[OK] все подделанные токены отклонены",
+                    }
+                    print(f"       └─ ВЕРДИКТ: {verdict_labels.get(result.jwt_verdict, result.jwt_verdict)}")
 
-            if result.nextjs_cve_verdict:
-                cve_verdict_labels = {
-                    "confirmed_bypass": "[!!! ПОДТВЕРЖДЕНО] x-middleware-subrequest обходит Next.js middleware (CVE-2025-29927, CVSS 9.1)",
-                    "protected": "[OK] обход через x-middleware-subrequest не сработал",
-                    "not_applicable": "[i] эндпоинт и так доступен без обхода - тест неинформативен",
-                }
-                print(f"       └─ ВЕРДИКТ CVE-2025-29927: {cve_verdict_labels.get(result.nextjs_cve_verdict, result.nextjs_cve_verdict)}")
+                for cc in result.nextjs_cve_checks:
+                    if cc.error:
+                        print(f"       └─ CVE-2025-29927[{cc.payload}] ошибка: {cc.error}")
+                    elif cc.accepted:
+                        print(f"       └─ [!!! BYPASS] CVE-2025-29927 x-middleware-subrequest='{cc.payload}': status={cc.status_code} type={cc.content_type} size={cc.body_size}B")
+                        print(f"          PoC: {cc.curl_poc}")
+                    else:
+                        trivial_note = " (health-check-подобное тело)" if cc.is_trivial_body else ""
+                        print(f"       └─ CVE-2025-29927[{cc.payload}] отклонён: status={cc.status_code}{trivial_note}")
+
+                if result.nextjs_cve_verdict:
+                    cve_verdict_labels = {
+                        "confirmed_bypass": "[!!! ПОДТВЕРЖДЕНО] x-middleware-subrequest обходит Next.js middleware (CVE-2025-29927, CVSS 9.1)",
+                        "protected": "[OK] обход через x-middleware-subrequest не сработал",
+                        "not_applicable": "[i] эндпоинт и так доступен без обхода - тест неинформативен",
+                    }
+                    print(f"       └─ ВЕРДИКТ CVE-2025-29927: {cve_verdict_labels.get(result.nextjs_cve_verdict, result.nextjs_cve_verdict)}")
 
     ok_count = sum(1 for r in results if r.ok)
     fail_count = len(results) - ok_count
@@ -1209,7 +1401,8 @@ def main():
                         if c.error:
                             print(f"       └─ payload='{c.payload}' ({c.bypass_url}) ошибка: {c.error}")
                         elif c.accepted:
-                            print(f"       └─ [!!! BYPASS] payload='{c.payload}': status={c.status_code} type={c.content_type} size={c.body_size}B")
+                            print(f"       └─ [!!! BYPASS] payload='{c.payload}': status={c.status_code} type={c.content_type} size={c.body_size}B  severity={c.severity}"
+                                  + (f" ({', '.join(c.sensitive_indicators)})" if c.sensitive_indicators else ""))
                             print(f"          PoC: {c.curl_poc}")
                         else:
                             trivial_note = " (health-check-подобное тело)" if c.is_trivial_body else ""
@@ -1220,7 +1413,11 @@ def main():
                         "protected": "[OK] прямой доступ закрыт, все варианты обхода тоже отклонены",
                         "not_applicable": "[i] прямой доступ и так открыт - тест обхода неинформативен",
                     }
-                    print(f"       └─ ВЕРДИКТ: {verdict_labels.get(verdict, verdict)}")
+                    verdict_line = f"       └─ ВЕРДИКТ: {verdict_labels.get(verdict, verdict)}"
+                    if verdict == "confirmed_bypass":
+                        pair_severity, _ = aggregate_pair_severity(checks)
+                        verdict_line += f"  [SEVERITY: {pair_severity}]"
+                    print(verdict_line)
 
             confirmed = [r for r in proxy_bypass_results if r[4] == "confirmed_bypass"]
             protected = [r for r in proxy_bypass_results if r[4] == "protected"]
@@ -1228,9 +1425,15 @@ def main():
             print(f"\n[*] Обход через прокси-ресурс - вердикты: подтверждён обход={len(confirmed)} | защищено={len(protected)} | не применимо={len(na)}")
 
             if confirmed:
-                print(f"\n[!!!] ПОДТВЕРЖДЁН ОБХОД АВТОРИЗАЦИИ через прокси-ресурс ({len(confirmed)}):")
+                high_count = sum(1 for r in confirmed if aggregate_pair_severity(r[5])[0] == "HIGH")
+                medium_count = sum(1 for r in confirmed if aggregate_pair_severity(r[5])[0] == "MEDIUM")
+                low_count = sum(1 for r in confirmed if aggregate_pair_severity(r[5])[0] == "LOW")
+                print(f"\n[!!!] ПОДТВЕРЖДЁН ОБХОД АВТОРИЗАЦИИ через прокси-ресурс ({len(confirmed)}): "
+                      f"HIGH={high_count} | MEDIUM={medium_count} | LOW={low_count}")
                 for direct_url, template, _, _, _, checks in confirmed:
-                    print(f"      - {direct_url}")
+                    severity, indicators = aggregate_pair_severity(checks)
+                    indicators_note = f"  ({', '.join(indicators)})" if indicators else ""
+                    print(f"      - [{severity}] {direct_url}{indicators_note}")
                     for c in checks:
                         if c.accepted:
                             print(f"        payload='{c.payload}'  PoC: {c.curl_poc}")
