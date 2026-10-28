@@ -1587,6 +1587,12 @@ def main():
                          help="Run all checks at once: --jwt-test, --jwt-kid-test, --check-nextjs-cve and (if "
                               "--proxy-bypass-map is given) --check-proxy-bypass. Individual flags can still be "
                               "combined with --full as usual (e.g. --full --jwt-azure-b2c)")
+    parser.add_argument("--exclude", metavar="CHECKS",
+                         help="Comma-separated list of checks to exclude from the scan (applied AFTER --full "
+                              "and the individual flags). Valid names: jwt, kid, nextjs, proxy "
+                              "(aliases: jwt-test, kid-test/jwt-kid, nextjs-cve/cve, proxy-bypass). "
+                              "The baseline reachability check always runs - use --skip-baseline to skip it. "
+                              "Example: --full --exclude kid,proxy")
 
     proxy_group = parser.add_argument_group("Authorization bypass via a gateway proxy resource (only for authorized testing of your own targets)")
     proxy_group.add_argument("--check-proxy-bypass", action="store_true",
@@ -1633,6 +1639,35 @@ def main():
             args.check_proxy_bypass = False
 
         print(f"[*] --full: enabled checks: {', '.join(enabled)}")
+
+    # --exclude: turn off named checks AFTER --full/individual flags are resolved
+    if args.exclude:
+        exclude_aliases = {
+            "jwt": "jwt", "jwt-test": "jwt",
+            "kid": "kid", "kid-test": "kid", "jwt-kid": "kid", "jwt-kid-test": "kid",
+            "nextjs": "nextjs", "nextjs-cve": "nextjs", "cve": "nextjs", "cve-2025-29927": "nextjs",
+            "proxy": "proxy", "proxy-bypass": "proxy",
+        }
+        excluded = set()
+        for raw in args.exclude.split(","):
+            name = raw.strip().lower()
+            if not name:
+                continue
+            canon = exclude_aliases.get(name)
+            if canon is None:
+                print(f"[!] --exclude: unknown check '{raw.strip()}' (valid: jwt, kid, nextjs, proxy), ignored", file=sys.stderr)
+                continue
+            excluded.add(canon)
+        if "jwt" in excluded:
+            args.jwt_test = False
+        if "kid" in excluded:
+            args.jwt_kid_test = False
+        if "nextjs" in excluded:
+            args.check_nextjs_cve = False
+        if "proxy" in excluded:
+            args.check_proxy_bypass = False
+        if excluded:
+            print(f"[*] Excluded checks: {', '.join(sorted(excluded))}")
 
     if args.check_proxy_bypass and not args.proxy_bypass_map and not args.paths:
         print("[!] --check-proxy-bypass requires --proxy-bypass-map and/or --paths (for auto mode)", file=sys.stderr)
