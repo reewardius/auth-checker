@@ -1,251 +1,62 @@
 # auth_checker
 
-A concurrent authorization-bypass checker for HTTP/JSON endpoints. It runs a
-baseline reachability check on every target and, on request, a set of
-authorization-bypass tests (JWT forgery, JWT `kid` signature bypass, the Next.js
-`CVE-2025-29927` middleware bypass, and proxy-path traversal bypass). Findings
-are printed to the console with ready-to-paste `curl` PoCs and written
-incrementally to a JSON file.
+A concurrent authorization-bypass checker for HTTP/JSON APIs. It runs a baseline
+reachability check on every target and, on request, a set of bypass tests — JWT
+forgery, JWT `kid` signature bypass, the Next.js `CVE-2025-29927` middleware
+bypass, and proxy-path traversal — printing ready-to-paste `curl` PoCs and
+writing findings to JSON. It can also discover endpoints directly from
+Swagger/OpenAPI specs.
 
-> **Authorized use only.** Run this only against systems you own or have explicit
-> written permission to test. The bypass tests send forged tokens and traversal
-> payloads and are intended for your own targets in a lab or an authorized
-> engagement.
+> **Authorized use only.** Run this only against systems you own or are
+> explicitly permitted to test.
 
 ---
 
-## Examples
+## Install
 
 ```bash
-# Baseline only, 20 threads, custom timeout
-python3 auth_checker.py -f targets.txt -w 20 -t 15
-
-# JWT forgery with a custom secret and Azure B2C payload
-python3 auth_checker.py -f targets.txt --jwt-test --jwt-secret s3cr3t --jwt-azure-b2c
-
-# Only the kid signature-bypass test
-python3 auth_checker.py -f targets.txt --jwt-kid-test
-
-# Next.js CVE check with an auth header
-python3 auth_checker.py -f targets.txt --check-nextjs-cve --header 'Cookie: session=abc'
-
-# Impersonation: forge sessions for specific users
-python3 auth_checker.py -f targets.txt --jwt-test --jwt-identities victims.json
-
-# Proxy-path bypass from an explicit map
-python3 auth_checker.py -f targets.txt --check-proxy-bypass --proxy-bypass-map map.txt
-
-# Full sweep, progress bar, results to file
-python3 auth_checker.py -f targets.txt -p paths.txt --full --tqdm -o results.json
-
-# Swagger mode: discover endpoints from Swagger/OpenAPI specs, then check them
-python3 auth_checker.py -f swagger_endpoints.txt --swagger -o results.json
-python3 auth_checker.py -f swagger_endpoints.txt --swagger --full -o results.json
-```
-
----
-
-## Requirements
-
-- Python 3.9+
-- [`requests`](https://pypi.org/project/requests/) (required)
-- [`tqdm`](https://pypi.org/project/tqdm/) (optional, only for the `--tqdm` progress bar)
-
-```bash
-pip install requests
-pip install tqdm   # optional
+pip install requests     # required
+pip install tqdm         # optional, only for the --tqdm progress bar
 ```
 
 ---
 
 ## Quick start
 
-Create a targets file, one URL per line (empty lines and lines starting with `#`
-are ignored; a line without a scheme defaults to `http://`):
-
-```text
-# targets.txt
-https://api.example.com/v1/users
-https://api.example.com/v1/orders
-```
-
-Run the baseline check:
-
 ```bash
+# Baseline check of a list of URLs
 python3 auth_checker.py -f targets.txt
-```
 
-Run everything at once:
+# All checks, results to JSON
+python3 auth_checker.py -f targets.txt --full -o results.json
 
-```bash
-python3 auth_checker.py -f targets.txt --full -p paths.txt -o results.json
-```
-
----
-
-## What it checks
-
-### 1. Baseline (always runs unless `--skip-baseline`)
-
-For each target URL a response counts as **OK** only if **all** of these hold:
-
-- HTTP status is `200`
-- `Content-Type` is `application/json` or `text/plain`
-- body is non-empty (not 0 bytes)
-- body is not a trivial health-check (`OK`, `HEALTHY`, `PONG`, `{"status":"ok"}`, …)
-
-Trivial health-check bodies are filtered as false positives by default. Disable
-that with `--allow-trivial-bodies`, or add your own trivial values with
-`--ignore-body-value VALUE` (repeatable).
-
-A baseline-OK endpoint that requires no token is itself a finding
-(`no_auth_required`).
-
-### 2. JWT forgery — `--jwt-test`
-
-Sends a battery of forged tokens, each delivered both as a `Bearer` header and as
-a cookie:
-
-- `hs256_default_secret` — HS256 signed with a weak secret (`--jwt-secret`, default `secret`)
-- `alg_none` / `alg_None` / `alg_NONE` — `alg:none` tokens (case variants)
-- `alg_none_empty_payload` — `alg:none` with an empty payload
-- `rs256_to_hs256_confusion` — RS256→HS256 key-confusion (only if `--jwt-rsa-pubkey` is given)
-- `garbage_signature` — **negative control**: valid structure, random signature
-
-The negative control is what makes the verdict trustworthy: if even a garbage
-signature is accepted, the server is not checking signatures at all (as opposed
-to merely using a weak secret).
-
-### 3. JWT `kid` signature bypass — `--jwt-kid-test`
-
-A **differential** test for servers that skip signature validation when a `kid`
-header is present. It sends the same garbage-signed token **without** `kid` and
-**with** `kid` (for `alg` = HS256 / RS256 / none) and compares the responses.
-
-This matters because such a bug often does **not** produce a `200` — the server
-may still return `401`, but with a *different* error (e.g. `"signature key not
-found"` without `kid` vs `"issuer is invalid"` with `kid`). The differential
-logic catches exactly that transition from the signature stage to the claim
-stage. See the verdict table below.
-
-### 4. Next.js middleware bypass (CVE-2025-29927) — `--check-nextjs-cve`
-
-Sends the `x-middleware-subrequest` header with known payloads. If an endpoint
-that is otherwise not reachable starts returning real data, the middleware
-(and any auth it implements) was bypassed. Affects Next.js `< 12.3.5`,
-`< 13.5.9`, `< 14.2.25`, `< 15.2.3` (CVSS 9.1).
-
-### 5. Proxy-path traversal bypass — `--check-proxy-bypass`
-
-Tests whether a protected resource can be reached through an adjacent **public**
-proxy path (e.g. `/api/swagger/…`) using encoded path traversal (`%2e%2e`, …),
-when the authorizer is bound to the direct route rather than the backend.
-Relevant for AWS API Gateway `{proxy+}`, Swagger proxies, and similar
-reverse-proxy routes.
-
-Two ways to supply pairs (you can use both together):
-
-- **Manual map** (`--proxy-bypass-map FILE`) — one `direct_URL => bypass_template`
-  per line; the template must contain `{payload}`:
-
-  ```text
-  https://host/dev/api/v1/items?x=1 => https://host/dev/api/swagger/{payload}v1/items?x=1
-  ```
-
-- **Auto mode** (`--paths FILE`) — for each target × protected path, the tool
-  generates traversal candidates through a built-in list of common public
-  prefixes (`swagger`, `api-docs`, `openapi`, `public`, `health`, `prod/api`, …).
-
-Confirmed bypasses are assigned a **severity** from the leaked body:
-
-| Severity | Meaning |
-|----------|---------|
-| `HIGH`   | credentials/secrets in the body (passwords, tokens, API keys, Luhn-valid card numbers, IBAN, JWT-like strings) |
-| `MEDIUM` | PII-like fields (email, phone, address, name, …), or confirmed but unknown/binary body |
-| `LOW`    | bypass technically confirmed, but no clearly sensitive data found |
-
----
-
-## Swagger mode (`--swagger`)
-
-With `--swagger`, the `-f` file is treated as a list of **Swagger UI URLs**
-instead of target endpoints. For each source the tool:
-
-1. tries common spec locations (`/swagger/v1/swagger.json`, `/openapi.json`,
-   `/swagger/swagger-ui-init.js`, …), including the JS-embedded `swaggerDoc`;
-2. parses the OpenAPI/Swagger spec and extracts every endpoint path;
-3. keeps the **GET** endpoints and expands `{id}`-style path params into probe
-   values (`1`, `2`, `3`, `me`, `current`, `admin`);
-4. runs the **same checks** as in normal mode (baseline, and whatever of
-   `--jwt-test` / `--jwt-kid-test` / `--check-nextjs-cve` you add) against the
-   discovered URLs, writing findings to the same JSON output.
-
-The input file accepts both plain-URL lines and **nuclei-style** output lines —
-the first `http(s)` token on each line is used, so nuclei output can be fed
-directly. `-p/--paths` is ignored in this mode (paths come from the spec).
-
-Typical workflow:
-
-```bash
-# 1) discover Swagger UIs with nuclei
-nuclei -l alive_http_services_advanced.txt -t swagger.yaml \
-       -o swagger_endpoints.txt -rl 1000 -c 100
-
-# 2) extract endpoints from the specs and run the checks
-python3 auth_checker.py -f swagger_endpoints.txt --swagger -o results.json
-
-# with all bypass checks too
+# Discover endpoints from Swagger specs, then check them
 python3 auth_checker.py -f swagger_endpoints.txt --swagger --full -o results.json
 ```
 
----
-
-## `--full`
-
-Enables `--jwt-test`, `--jwt-kid-test`, and `--check-nextjs-cve` at once, plus
-`--check-proxy-bypass` **if** a `--proxy-bypass-map` or `--paths` is provided.
-Under `--full` the JWT test runs **both** built-in profiles (`generic_admin` and
-`azure_b2c`) unless you set your own `--jwt-payload` / `--jwt-azure-b2c` /
-`--jwt-claim`.
-
-```bash
-# full sweep with auto proxy-bypass from a protected-paths file
-python3 auth_checker.py -f targets.txt -p paths.txt --full -o results.json
-
-# full sweep with an explicit proxy map
-python3 auth_checker.py -f targets.txt --full --proxy-bypass-map map.txt
-```
+`targets.txt`: one URL per line; blank lines and `#` comments are ignored; a line
+without a scheme gets `http://`.
 
 ---
 
-## Excluding checks (`--exclude`)
+## Checks
 
-`--exclude` takes a comma-separated list of check names and turns those checks
-off. It is applied **after** `--full` and the individual flags, so the usual
-pattern is "enable everything, then drop a few":
+The **baseline** check always runs: a response counts as OK only if it is status
+`200`, `Content-Type` is `application/json` or `text/plain`, the body is
+non-empty, and it is not a trivial health-check (`OK`/`HEALTHY`/`{"status":"ok"}`…).
+An endpoint that is baseline-OK **without any token** is itself a finding.
 
-```bash
-# everything except the kid test and the (noisy) proxy auto-scan
-python3 auth_checker.py -f targets.txt --full --exclude kid,proxy
+The bypass tests below are opt-in. Each has a short **name** used by `--exclude`.
 
-# swagger discovery, all checks except Next.js CVE
-python3 auth_checker.py -f swagger_endpoints.txt --swagger --full --exclude nextjs
-```
+| Name | Enable with | What it does |
+|------|-------------|--------------|
+| `jwt` | `--jwt-test` | Forged JWTs: weak HMAC secret, `alg=none` (+ case variants), RS256→HS256 confusion, plus a garbage-signature negative control. |
+| `kid` | `--jwt-kid-test` | Differential test — same forged token with vs. without a `kid` header; catches servers that skip signature validation when `kid` is present. |
+| `nextjs` | `--check-nextjs-cve` | CVE-2025-29927 — Next.js middleware auth bypass via the `x-middleware-subrequest` header. |
+| `proxy` | `--check-proxy-bypass` | Reaches a protected resource through an adjacent public proxy path using encoded path traversal; confirmed hits get a HIGH/MEDIUM/LOW severity from the leaked body. |
 
-| Name | Check it disables | Equivalent flag | Aliases |
-|------|-------------------|-----------------|---------|
-| `jwt` | JWT forgery (weak secret, `alg=none`, RS256→HS256) | `--jwt-test` | `jwt-test` |
-| `kid` | JWT `kid` signature bypass (differential) | `--jwt-kid-test` | `kid-test`, `jwt-kid`, `jwt-kid-test` |
-| `nextjs` | Next.js middleware bypass (CVE-2025-29927) | `--check-nextjs-cve` | `nextjs-cve`, `cve`, `cve-2025-29927` |
-| `proxy` | Proxy-path traversal bypass | `--check-proxy-bypass` | `proxy-bypass` |
-
-Notes:
-
-- Names are case-insensitive; unknown names are warned about on stderr and ignored.
-- The **baseline** reachability check is not excludable here — it always runs (and
-  other checks depend on its result). To skip it entirely, use `--skip-baseline`.
-- Excluding a check also suppresses its "requires ..." validation, so e.g.
-  `--check-proxy-bypass --exclude proxy` will not error about a missing map.
+- `--full` enables `jwt`, `kid`, `nextjs`, and (if a map or `--paths` is given) `proxy`.
+- `--exclude name1,name2` turns checks off **after** `--full` / individual flags, e.g. `--full --exclude kid,proxy`.
 
 ---
 
@@ -253,123 +64,105 @@ Notes:
 
 | Flag | Description |
 |------|-------------|
-| `-f, --file` | **Required.** Targets file (one URL/domain per line). |
-| `-p, --paths` | Paths file; each path is appended to every target (and feeds auto proxy-bypass). |
-| `--swagger` | Treat `-f` as a list of Swagger UI URLs; discover endpoints from the specs and check them (see "Swagger mode" below). |
+| `-f, --file` | **Required.** Input file (targets, or Swagger UI URLs with `--swagger`). |
+| `-o, --output` | Findings JSON (default `auth_results.json`), written incrementally and atomically. |
+| `-w, --workers` | Threads (default `10`). |
 | `-t, --timeout` | Per-request timeout in seconds (default `10`). |
-| `-w, --workers` | Parallel threads (default `10`). |
-| `-m, --method` | HTTP method for the baseline: `GET` (default), `HEAD`, `POST`. |
-| `-o, --output` | Findings JSON path (default `auth_results.json`), written incrementally. |
-| `--no-verify-ssl` | Disable TLS certificate verification. |
+| `-m, --method` | Baseline HTTP method: `GET` (default), `HEAD`, `POST`. |
+| `-p, --paths` | Paths appended to each target; also feeds proxy auto mode. |
 | `--header` | Extra `Key: Value` header (repeatable). |
-| `--fail-only` | Print only failed/finding lines to the console. |
-| `--tqdm` | Show a progress bar instead of the per-URL log (needs `tqdm`). |
+| `--no-verify-ssl` | Disable TLS verification. |
+| `--fail-only` | Console: print only failures/findings. |
+| `--tqdm` | Progress bar instead of the per-line log. |
 | `--allow-trivial-bodies` | Do not filter health-check bodies as false positives. |
-| `--ignore-body-value` | Extra trivial body value to filter (repeatable). |
-| `--check-nextjs-cve` | Enable the CVE-2025-29927 check. |
-| `--jwt-test` | Enable JWT forgery checks. |
-| `--jwt-kid-test` | Enable the differential JWT `kid` signature-bypass check. |
-| `--jwt-secret` | HS256 secret for the weak-secret token (default `secret`). |
-| `--jwt-payload` | JSON file with custom token claims. |
-| `--jwt-header-name` | Header for the Bearer variant (default `Authorization`). |
-| `--jwt-cookie-name` | Cookie name for the cookie variant (default `access_token`). |
-| `--jwt-azure-b2c` | Use an Azure AD B2C style payload as the default. |
-| `--jwt-rsa-pubkey` | File or URL of a public RSA key (PEM) for RS256→HS256 confusion. |
-| `--jwt-claim` | Override/add a single claim `KEY=VALUE` (repeatable; value parsed as JSON). |
-| `--jwt-identities` | JSON file of identities to forge sessions for (impersonation testing). |
-| `--check-proxy-bypass` | Enable proxy-path traversal bypass (needs `--proxy-bypass-map` and/or `--paths`). |
-| `--proxy-bypass-map` | File of `direct_URL => bypass_template` pairs. |
+| `--ignore-body-value V` | Add a trivial body value to the filter (repeatable). |
+| `--full` | Run all checks (see **Checks**). |
+| `--exclude` | Comma-separated check names to skip: `jwt`, `kid`, `nextjs`, `proxy`. |
+| `--swagger` | Treat `-f` as Swagger UI URLs and discover endpoints (see **Swagger mode**). |
 | `--skip-baseline` | Skip phase 1 and go straight to proxy-bypass. |
-| `--full` | Run all checks at once (see above). |
-| `--exclude` | Comma-separated checks to exclude from the scan (see "Excluding checks"). |
+
+**JWT tuning:** `--jwt-secret`, `--jwt-payload FILE`, `--jwt-azure-b2c`,
+`--jwt-claim K=V` (repeatable), `--jwt-rsa-pubkey FILE|URL`,
+`--jwt-identities FILE`, `--jwt-header-name`, `--jwt-cookie-name`.
+**Proxy tuning:** `--proxy-bypass-map FILE`.
 
 ---
 
-## Verdict reference
+## Swagger mode
 
-**JWT (`jwt_verdict`)**
+With `--swagger`, `-f` is a list of Swagger UI URLs — plain, or nuclei output
+(the first `http(s)` token on each line is used). For each source the tool fetches
+the spec (`swagger.json` / `openapi.json` / `swagger-ui-init.js`), extracts the
+GET endpoints, expands `{id}`-style params into `1/2/3/me/current/admin`, and runs
+the same checks against them. `-p/--paths` is ignored in this mode.
 
-| Verdict | Meaning |
-|---------|---------|
-| `no_auth_required` | Endpoint returns 200 without any token. |
-| `confirmed_vulnerable` | Server validates signatures but accepted a forged token (weak secret / `alg=none`). |
-| `signature_not_validated` | Signature not checked at all — even the garbage control was accepted. |
-| `protected` | All forged tokens rejected. |
-
-**JWT kid (`kid_verdict`)**
-
-| Verdict | Meaning |
-|---------|---------|
-| `confirmed_full_bypass` | A token with `kid` was fully accepted (200 + data). |
-| `signature_check_skipped_with_kid` | Without `kid` the server rejected on signature/key; with `kid` it moved on to claim checks → signature not verified when `kid` is present. |
-| `differential_behavior_review` | `kid` changes the response, but the stage can't be classified automatically — review the body. |
-| `protected` | `kid` changes nothing. |
-
-**Next.js CVE (`nextjs_cve_verdict`)**
-
-| Verdict | Meaning |
-|---------|---------|
-| `confirmed_bypass` | `x-middleware-subrequest` returned real data on a closed endpoint. |
-| `protected` | Bypass did not work. |
-| `not_applicable` | Endpoint was already reachable without the bypass. |
-
-**Proxy bypass (`verdict`)**
-
-| Verdict | Meaning |
-|---------|---------|
-| `confirmed_bypass` | Direct access closed, but the proxy path returned data (see `severity`). |
-| `protected` | Direct closed, all bypass variants rejected. |
-| `not_applicable` | Direct access already open. |
-
----
-
-## Output file
-
-- Only **findings** are written — cleanly protected endpoints and
-  404/network-error results stay in the console log only.
-- An endpoint that is **open without any token** (baseline 200) is recorded as a
-  single `no_auth_required` finding: the JWT and `kid` token batteries are skipped
-  for it (every forged token would be trivially "accepted" because there is no auth
-  to bypass), so you don't get dozens of near-duplicate entries differing only by
-  token `kind`.
-- Writes are **atomic** (temp file + `os.replace`) and **incremental**, so the
-  file is always valid JSON and can be tailed while the run is in progress.
-- Format depends on whether proxy-bypass is enabled:
-
-Without `--check-proxy-bypass` — a flat list of finding objects:
-
-```json
-[
-  { "url": "...", "ok": true, "jwt_verdict": "...", "kid_verdict": "...", "...": "..." }
-]
+```bash
+nuclei -l alive.txt -t swagger.yaml -o swagger_endpoints.txt -rl 1000 -c 100
+python3 auth_checker.py -f swagger_endpoints.txt --swagger --full -o results.json
 ```
 
-With `--check-proxy-bypass` — an object with two keys:
+---
 
-```json
-{
-  "results": [ { "url": "...", "...": "..." } ],
-  "proxy_bypass": [
-    {
-      "direct_url": "...",
-      "template": "...",
-      "verdict": "confirmed_bypass",
-      "severity": "HIGH",
-      "sensitive_indicators": ["key:password"],
-      "checks": [ { "payload": "...", "curl_poc": "...", "...": "..." } ]
-    }
-  ]
-}
+## Examples
+
+```bash
+# Baseline, 50 threads, save to file
+python3 auth_checker.py -f targets.txt -w 50 -o results.json
+
+# JWT forgery with a custom secret + Azure B2C payload
+python3 auth_checker.py -f targets.txt --jwt-test --jwt-secret s3cr3t --jwt-azure-b2c
+
+# RS256 -> HS256 key confusion with a public key
+python3 auth_checker.py -f targets.txt --jwt-test --jwt-rsa-pubkey pubkey.pem
+
+# Impersonate specific users
+python3 auth_checker.py -f targets.txt --jwt-test --jwt-identities victims.json
+
+# Only the kid signature-bypass test
+python3 auth_checker.py -f targets.txt --jwt-kid-test
+
+# Next.js CVE with a session cookie
+python3 auth_checker.py -f targets.txt --check-nextjs-cve --header 'Cookie: session=abc'
+
+# Proxy bypass: explicit map / auto from protected paths
+python3 auth_checker.py -f targets.txt --check-proxy-bypass --proxy-bypass-map map.txt
+python3 auth_checker.py -f targets.txt -p protected_paths.txt --check-proxy-bypass
+
+# Full sweep, excluding the noisy proxy auto-scan
+python3 auth_checker.py -f targets.txt --full --exclude proxy --tqdm -o results.json
+
+# Swagger discovery + all checks
+python3 auth_checker.py -f swagger_endpoints.txt --swagger --full -o results.json
 ```
 
-Each finding keeps only the accepted/meaningful attempts (real PoCs), not the
-rejected negative controls.
+Input-file formats:
+
+- `--proxy-bypass-map`: `direct_URL => bypass_template` per line; the template must contain `{payload}`.
+- `--jwt-identities`: JSON array, e.g. `[{"sub":"...","emails":["u@corp.com"]}, ...]`.
 
 ---
 
-## Exit codes
+## Output
 
-| Code | Meaning |
-|------|---------|
-| `0` | No baseline failures. |
-| `2` | At least one baseline target failed (note: a protected endpoint is a "fail" for the baseline, which is the expected/secure outcome). |
+Only **findings** are written — cleanly protected and 404/error results stay in
+the console log. Writes are incremental and atomic, so the file is always valid
+JSON and can be tailed during a run.
+
+- Without `--check-proxy-bypass`: a flat list of finding objects.
+- With it: `{ "results": [...], "proxy_bypass": [...] }` (each proxy entry carries `severity` and `sensitive_indicators`).
+
+An endpoint open **without any token** is recorded once as `no_auth_required`; the
+JWT and `kid` batteries are skipped for it, so you don't get many entries that
+differ only by token `kind`.
+
+Exit code: `0` if there were no baseline failures, else `2` (a protected endpoint
+counts as a baseline "failure" — the secure outcome).
+
+---
+
+## Verdicts
+
+- **JWT** — `no_auth_required` · `confirmed_vulnerable` (forged token accepted) · `signature_not_validated` (garbage accepted) · `protected`
+- **kid** — `confirmed_full_bypass` · `signature_check_skipped_with_kid` · `differential_behavior_review` · `protected`
+- **Next.js CVE** — `confirmed_bypass` · `protected` · `not_applicable`
+- **Proxy** — `confirmed_bypass` (+ severity) · `protected` · `not_applicable`
