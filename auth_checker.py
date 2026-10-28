@@ -1101,6 +1101,215 @@ def build_urls(targets: list[str], paths: Optional[list[str]]) -> list[str]:
     return urls
 
 
+# ---------------------------------------------------------------------------
+# Swagger / OpenAPI endpoint discovery (--swagger)
+# ---------------------------------------------------------------------------
+# Given a list of Swagger UI URLs (e.g. nuclei swagger-api output), this tries a
+# set of common spec locations (swagger.json / openapi.json / *-ui-init.js),
+# parses the OpenAPI/Swagger spec, and extracts every endpoint path. GET
+# endpoints are expanded into concrete URLs (with {id}-style params replaced by
+# a few probe values) which are then run through the same checks as any other
+# target.
+SWAGGER_JSON_SUFFIXES = [
+    "/swagger/v1/swagger.json",
+    "/swagger.json",
+    "/v2/api-docs",
+    "/api-docs",
+    "/swagger/doc.json",
+    "/api/swagger.json",
+    "/openapi.json",
+    "/swagger/developer/swagger.json",
+]
+SWAGGER_JS_SUFFIXES = [
+    "/swagger/swagger-ui-init.js",
+    "/api/swagger/swagger-ui-init.js",
+    "/swagger-ui-init.js",
+]
+SWAGGER_HTTP_METHODS = ("get", "post", "put", "delete", "patch", "head", "options")
+SWAGGER_ID_PROBE_VALUES = [1, 2, 3, "me", "current", "admin"]
+_ID_PARAM_RE = re.compile(r'\{[^}]*[iI][dD][^}]*\}')
+_URL_IN_LINE_RE = re.compile(r'https?://[^\s\]]+')
+
+
+def get_base_from_url(url: str) -> str:
+    """Scheme + host of a URL, e.g. https://host:8080 ."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def extract_swagger_from_js(js_content: str) -> Optional[dict]:
+    """Extracts the Swagger spec embedded in a swagger-ui-init.js file
+    (the "swaggerDoc": { ... } object), balancing nested braces."""
+    try:
+        start_marker = '"swaggerDoc":'
+        pos = js_content.find(start_marker)
+        if pos == -1:
+            return None
+        start_idx = pos + len(start_marker)
+        while start_idx < len(js_content) and js_content[start_idx].isspace():
+            start_idx += 1
+        if start_idx >= len(js_content) or js_content[start_idx] != '{':
+            return None
+        brace_count = 1
+        end_idx = start_idx + 1
+        while end_idx < len(js_content) and brace_count > 0:
+            if js_content[end_idx] == '{':
+                brace_count += 1
+            elif js_content[end_idx] == '}':
+                brace_count -= 1
+            end_idx += 1
+        if brace_count != 0:
+            return None
+        return json.loads(js_content[start_idx:end_idx].strip())
+    except Exception:
+        return None
+
+
+def generate_swagger_candidate_urls(swagger_ui_url: str) -> tuple[list[str], list[str]]:
+    """Generates candidate spec URLs (JSON and JS) for a Swagger UI URL."""
+    base_url = get_base_from_url(swagger_ui_url)
+    path = urlparse(swagger_ui_url).path.lower()
+
+    json_urls = [base_url + s for s in SWAGGER_JSON_SUFFIXES]
+    js_urls = [base_url + s for s in SWAGGER_JS_SUFFIXES]
+
+    if path.endswith("/swagger-ui.js"):
+        json_urls += [f"{base_url}/swagger.json", f"{base_url}/v2/api-docs", f"{base_url}/api/swagger.json"]
+        js_urls += [f"{base_url}/swagger-ui-init.js", f"{base_url}/swagger/swagger-ui-init.js"]
+    elif "/swagger/index.html" in path:
+        swagger_base = path.replace("/index.html", "")
+        json_urls += [f"{base_url}{swagger_base}/v1/swagger.json",
+                      f"{base_url}{swagger_base}/swagger.json",
+                      f"{base_url}{swagger_base}/doc.json"]
+        js_urls.append(f"{base_url}{swagger_base}/swagger-ui-init.js")
+    elif path.endswith("/api/swagger"):
+        api_base = path.replace("/swagger", "")
+        json_urls += [f"{base_url}{api_base}/swagger.json",
+                      f"{base_url}{api_base}/swagger/swagger.json",
+                      f"{base_url}{api_base}/v2/api-docs"]
+        js_urls.append(f"{base_url}/api/swagger/swagger-ui-init.js")
+    elif "swagger" in path:
+        if path.endswith((".js", ".html", ".htm")):
+            json_urls.append(f"{base_url}{path.rsplit('.', 1)[0]}.json")
+        dir_path = "/".join(path.split("/")[:-1])
+        if dir_path:
+            json_urls.append(f"{base_url}{dir_path}/swagger.json")
+            js_urls.append(f"{base_url}{dir_path}/swagger-ui-init.js")
+
+    return list(dict.fromkeys(json_urls)), list(dict.fromkeys(js_urls))
+
+
+def has_id_parameter(url: str) -> bool:
+    """True if the URL has an {...id...}-style path parameter."""
+    return _ID_PARAM_RE.search(url) is not None
+
+
+def generate_id_variants(url: str) -> list[str]:
+    """Replaces {id}-style params with a few probe values (1/2/3/me/current/admin)."""
+    return [_ID_PARAM_RE.sub(str(v), url) for v in SWAGGER_ID_PROBE_VALUES]
+
+
+def extract_endpoints_from_swagger(swagger_ui_url: str, timeout: int, verify_ssl: bool,
+                                   headers: dict, quiet: bool = False) -> list[tuple]:
+    """Fetches and parses the Swagger/OpenAPI spec for one Swagger UI URL and
+    returns a list of (full_endpoint_url, [http_methods]). Empty if no spec found."""
+    base_url = get_base_from_url(swagger_ui_url)
+    endpoints = []
+    if not quiet:
+        print(f"[swagger] processing: {swagger_ui_url}")
+
+    json_urls, js_urls = generate_swagger_candidate_urls(swagger_ui_url)
+    js_set = set(js_urls)
+
+    for spec_url in json_urls + js_urls:
+        try:
+            resp = safe_get(spec_url, headers=headers, verify=verify_ssl, timeout=timeout)
+        except requests.exceptions.RequestException:
+            continue
+        if resp.status_code != 200:
+            continue
+
+        data = None
+        if spec_url in js_set or spec_url.endswith(".js"):
+            data = extract_swagger_from_js(resp.text)
+        else:
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if "application/json" in ctype or spec_url.endswith(".json"):
+                try:
+                    data = resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    data = None
+        if not data:
+            continue
+
+        if isinstance(data, dict) and "paths" in data and (data.get("swagger") or data.get("openapi")):
+            spec_paths = data.get("paths", {})
+            if not quiet:
+                print(f"[swagger]   spec found at {spec_url} "
+                      f"(version {data.get('swagger') or data.get('openapi')}, {len(spec_paths)} endpoints)")
+            for endpoint, methods_obj in spec_paths.items():
+                if not isinstance(methods_obj, dict):
+                    continue
+                http_methods = [m.lower() for m in methods_obj.keys() if m.lower() in SWAGGER_HTTP_METHODS]
+                if http_methods:
+                    endpoints.append((base_url + endpoint, http_methods))
+            return endpoints
+
+    if not quiet:
+        print(f"[swagger]   no spec found for {swagger_ui_url}")
+    return endpoints
+
+
+def read_swagger_sources(path: str) -> list[str]:
+    """Reads Swagger UI URLs from a file. Supports both plain-URL lines and
+    nuclei-style output lines (the first http(s) token on the line is taken).
+    Empty lines and lines starting with '#' are ignored."""
+    sources = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = _URL_IN_LINE_RE.search(line)
+                if m:
+                    sources.append(m.group(0))
+    except FileNotFoundError:
+        print(f"[!] File not found: {path}", file=sys.stderr)
+        sys.exit(1)
+    return list(dict.fromkeys(sources))
+
+
+def build_swagger_target_urls(sources: list[str], timeout: int, verify_ssl: bool,
+                              headers: dict, workers: int) -> list[str]:
+    """Extracts endpoints from all Swagger sources (threaded), keeps GET endpoints,
+    expands {id} params, and returns a deduped list of URLs to check."""
+    all_endpoints = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(extract_endpoints_from_swagger, src, timeout, verify_ssl, headers): src
+            for src in sources
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                all_endpoints.extend(future.result())
+            except Exception as e:
+                print(f"[swagger] error processing {futures[future]}: {e}", file=sys.stderr)
+
+    urls = []
+    for url, methods in all_endpoints:
+        if "get" not in methods:
+            continue
+        if has_id_parameter(url):
+            urls.extend(generate_id_variants(url))
+        else:
+            urls.append(url)
+    deduped = list(dict.fromkeys(urls))
+    print(f"\n[swagger] extracted {len(all_endpoints)} endpoints from {len(sources)} sources -> "
+          f"{len(deduped)} GET URLs to check (after id-variant expansion)")
+    return deduped
+
+
 def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers: dict,
                   jwt_test: bool = False, jwt_secret: str = "secret",
                   jwt_payload: Optional[dict] = None, jwt_header_name: str = "Authorization",
@@ -1314,6 +1523,12 @@ def main():
     parser = argparse.ArgumentParser(description="Check targets for 200 OK, content-type and non-empty body")
     parser.add_argument("-f", "--file", required=True, help="Path to the targets file (one URL/domain per line)")
     parser.add_argument("-p", "--paths", help="Path to a file with paths (e.g. index.html) to be appended in turn to each target")
+    parser.add_argument("--swagger", action="store_true",
+                         help="Treat the -f file as a list of Swagger UI URLs (e.g. nuclei swagger-api "
+                              "output; the first http(s) token on each line is used). Fetch and parse each "
+                              "OpenAPI/Swagger spec, extract all GET endpoints (expanding {id}-style params "
+                              "into 1/2/3/me/current/admin), and run the same checks against them. "
+                              "The -p/--paths option is ignored in this mode (paths come from the spec).")
     parser.add_argument("-t", "--timeout", type=int, default=10, help="Request timeout in seconds (default 10)")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of parallel threads (default 10)")
     parser.add_argument("-m", "--method", default="GET", choices=["GET", "HEAD", "POST"], help="HTTP method (default GET; for HEAD the body is usually 0 bytes)")
@@ -1466,19 +1681,36 @@ def main():
     if not ignore_trivial_body:
         print("[*] Trivial health-check response filtering (OK/HEALTHY) is DISABLED (--allow-trivial-bodies)")
 
-    raw_targets = read_targets(args.file)
-    if not raw_targets:
-        print("[!] Targets list is empty.", file=sys.stderr)
-        sys.exit(1)
-
-    raw_paths = read_paths(args.paths) if args.paths else None
-    paths = raw_paths
-    targets = build_urls(raw_targets, paths)
-
-    if paths:
-        print(f"[*] Targets: {len(raw_targets)} x paths: {len(paths)} = {len(targets)} URLs. Starting check (threads: {args.workers})...\n")
+    if args.swagger:
+        if args.paths:
+            print("[i] --swagger: --paths is ignored in this mode (endpoints come from the spec)", file=sys.stderr)
+        swagger_sources = read_swagger_sources(args.file)
+        if not swagger_sources:
+            print("[!] No Swagger UI URLs found in the input file.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[*] Swagger sources loaded: {len(swagger_sources)}. Extracting endpoints (threads: {args.workers})...\n")
+        raw_targets = build_swagger_target_urls(swagger_sources, args.timeout, not args.no_verify_ssl, headers, args.workers)
+        if not raw_targets:
+            print("[!] No endpoints extracted from the Swagger specs.", file=sys.stderr)
+            sys.exit(1)
+        raw_paths = None
+        paths = None
+        targets = raw_targets
+        print(f"\n[*] {len(targets)} endpoint URLs to check. Starting check (threads: {args.workers})...\n")
     else:
-        print(f"[*] Targets loaded: {len(targets)}. Starting check (threads: {args.workers})...\n")
+        raw_targets = read_targets(args.file)
+        if not raw_targets:
+            print("[!] Targets list is empty.", file=sys.stderr)
+            sys.exit(1)
+
+        raw_paths = read_paths(args.paths) if args.paths else None
+        paths = raw_paths
+        targets = build_urls(raw_targets, paths)
+
+        if paths:
+            print(f"[*] Targets: {len(raw_targets)} x paths: {len(paths)} = {len(targets)} URLs. Starting check (threads: {args.workers})...\n")
+        else:
+            print(f"[*] Targets loaded: {len(targets)}. Starting check (threads: {args.workers})...\n")
 
     use_proxy_format = args.check_proxy_bypass  # fix the output format once for the whole run
     proxy_bypass_results = []  # list of (direct_url, template, baseline_ok, baseline_status, verdict, checks)
