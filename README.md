@@ -218,6 +218,37 @@ python3 auth_checker.py -f targets.txt --full --proxy-bypass-map map.txt
 
 ---
 
+## Excluding checks (`--exclude`)
+
+`--exclude` takes a comma-separated list of check names and turns those checks
+off. It is applied **after** `--full` and the individual flags, so the usual
+pattern is "enable everything, then drop a few":
+
+```bash
+# everything except the kid test and the (noisy) proxy auto-scan
+python3 auth_checker.py -f targets.txt --full --exclude kid,proxy
+
+# swagger discovery, all checks except Next.js CVE
+python3 auth_checker.py -f swagger_endpoints.txt --swagger --full --exclude nextjs
+```
+
+| Name | Check it disables | Equivalent flag | Aliases |
+|------|-------------------|-----------------|---------|
+| `jwt` | JWT forgery (weak secret, `alg=none`, RS256→HS256) | `--jwt-test` | `jwt-test` |
+| `kid` | JWT `kid` signature bypass (differential) | `--jwt-kid-test` | `kid-test`, `jwt-kid`, `jwt-kid-test` |
+| `nextjs` | Next.js middleware bypass (CVE-2025-29927) | `--check-nextjs-cve` | `nextjs-cve`, `cve`, `cve-2025-29927` |
+| `proxy` | Proxy-path traversal bypass | `--check-proxy-bypass` | `proxy-bypass` |
+
+Notes:
+
+- Names are case-insensitive; unknown names are warned about on stderr and ignored.
+- The **baseline** reachability check is not excludable here — it always runs (and
+  other checks depend on its result). To skip it entirely, use `--skip-baseline`.
+- Excluding a check also suppresses its "requires ..." validation, so e.g.
+  `--check-proxy-bypass --exclude proxy` will not error about a missing map.
+
+---
+
 ## Options
 
 | Flag | Description |
@@ -250,6 +281,7 @@ python3 auth_checker.py -f targets.txt --full --proxy-bypass-map map.txt
 | `--proxy-bypass-map` | File of `direct_URL => bypass_template` pairs. |
 | `--skip-baseline` | Skip phase 1 and go straight to proxy-bypass. |
 | `--full` | Run all checks at once (see above). |
+| `--exclude` | Comma-separated checks to exclude from the scan (see "Excluding checks"). |
 
 ---
 
