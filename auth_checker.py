@@ -90,7 +90,15 @@ def safe_get(url: str, **kwargs):
 
 def safe_request(method: str, url: str, **kwargs):
     """Same as safe_get, but for an arbitrary HTTP method (requests.request)."""
-    hostname = urlparse(url).hostname
+    # A malformed URL (e.g. a nuclei log line read as a target, or a stray '[')
+    # makes urlparse raise ValueError on Python 3.9+ ("Invalid IPv6 URL"). That
+    # is not a RequestException, so it would otherwise crash the whole run via
+    # future.result(). Convert it to requests' InvalidURL (a RequestException
+    # subclass) so the existing error-handling branches record it per-target.
+    try:
+        hostname = urlparse(url).hostname
+    except ValueError as e:
+        raise requests.exceptions.InvalidURL(f"Invalid URL '{url}': {e}")
     if hostname and not _host_resolves(hostname):
         raise requests.exceptions.ConnectionError(
             f"Host does not resolve (cached, request skipped): {hostname}"
@@ -1132,8 +1140,11 @@ _URL_IN_LINE_RE = re.compile(r'https?://[^\s\]]+')
 
 
 def get_base_from_url(url: str) -> str:
-    """Scheme + host of a URL, e.g. https://host:8080 ."""
-    parsed = urlparse(url)
+    """Scheme + host of a URL, e.g. https://host:8080 . Returns "" on a malformed URL."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
@@ -1168,7 +1179,10 @@ def extract_swagger_from_js(js_content: str) -> Optional[dict]:
 def generate_swagger_candidate_urls(swagger_ui_url: str) -> tuple[list[str], list[str]]:
     """Generates candidate spec URLs (JSON and JS) for a Swagger UI URL."""
     base_url = get_base_from_url(swagger_ui_url)
-    path = urlparse(swagger_ui_url).path.lower()
+    try:
+        path = urlparse(swagger_ui_url).path.lower()
+    except ValueError:
+        path = ""
 
     json_urls = [base_url + s for s in SWAGGER_JSON_SUFFIXES]
     js_urls = [base_url + s for s in SWAGGER_JS_SUFFIXES]
@@ -1215,6 +1229,10 @@ def extract_endpoints_from_swagger(swagger_ui_url: str, timeout: int, verify_ssl
     returns a list of (full_endpoint_url, [http_methods]). Empty if no spec found."""
     base_url = get_base_from_url(swagger_ui_url)
     endpoints = []
+    if not base_url:
+        if not quiet:
+            print(f"[swagger]   skipped malformed source: {swagger_ui_url}")
+        return endpoints
     if not quiet:
         print(f"[swagger] processing: {swagger_ui_url}")
 
@@ -1344,7 +1362,13 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
 
     jwt_checks = []
     jwt_verdict = None
-    if jwt_test:
+    if jwt_test and baseline_ok:
+        # Endpoint is reachable without any token at all - every forged token would be
+        # trivially "accepted" (there is no auth to bypass), producing many near-duplicate
+        # findings that differ only by token `kind`. Record the real finding (no auth
+        # required) once and skip the whole token battery.
+        jwt_verdict = "no_auth_required"
+    elif jwt_test:
         # jwt_profiles: list of (profile_name, payload) - used under --full, where both
         # hardcoded profiles (generic_admin + azure_b2c) are run at once. Without it -
         # the normal single-profile mode (a single --jwt-payload/--jwt-azure-b2c/default).
@@ -1374,7 +1398,10 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
 
     nextjs_cve_checks = []
     nextjs_cve_verdict = None
-    if check_nextjs_cve:
+    if check_nextjs_cve and baseline_ok:
+        # Already reachable without the bypass - the test is uninformative, no requests needed.
+        nextjs_cve_verdict = "not_applicable"
+    elif check_nextjs_cve:
         nextjs_cve_verdict, nextjs_cve_checks = check_cve_2025_29927(
             url, timeout, verify_ssl, headers, baseline_ok,
             ignore_trivial_body=ignore_trivial_body, extra_trivial_values=extra_trivial_values,
@@ -1382,7 +1409,9 @@ def check_target(url: str, timeout: int, method: str, verify_ssl: bool, headers:
 
     kid_checks = []
     kid_verdict = None
-    if check_kid_bypass:
+    if check_kid_bypass and not baseline_ok:
+        # Skip when the endpoint is open without a token: the kid test would otherwise
+        # report a trivial "confirmed_full_bypass" simply because everything returns 200.
         # The payload here does not really matter (a full bypass still runs into the
         # issuer check), but the differential logic works for any payload.
         kid_payload = jwt_payload or default_jwt_payload()
