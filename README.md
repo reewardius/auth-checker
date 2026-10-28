@@ -37,6 +37,10 @@ python3 auth_checker.py -f targets.txt --check-proxy-bypass --proxy-bypass-map m
 
 # Full sweep, progress bar, results to file
 python3 auth_checker.py -f targets.txt -p paths.txt --full --tqdm -o results.json
+
+# Swagger mode: discover endpoints from Swagger/OpenAPI specs, then check them
+python3 auth_checker.py -f swagger_endpoints.txt --swagger -o results.json
+python3 auth_checker.py -f swagger_endpoints.txt --swagger --full -o results.json
 ```
 
 ---
@@ -162,6 +166,40 @@ Confirmed bypasses are assigned a **severity** from the leaked body:
 
 ---
 
+## Swagger mode (`--swagger`)
+
+With `--swagger`, the `-f` file is treated as a list of **Swagger UI URLs**
+instead of target endpoints. For each source the tool:
+
+1. tries common spec locations (`/swagger/v1/swagger.json`, `/openapi.json`,
+   `/swagger/swagger-ui-init.js`, …), including the JS-embedded `swaggerDoc`;
+2. parses the OpenAPI/Swagger spec and extracts every endpoint path;
+3. keeps the **GET** endpoints and expands `{id}`-style path params into probe
+   values (`1`, `2`, `3`, `me`, `current`, `admin`);
+4. runs the **same checks** as in normal mode (baseline, and whatever of
+   `--jwt-test` / `--jwt-kid-test` / `--check-nextjs-cve` you add) against the
+   discovered URLs, writing findings to the same JSON output.
+
+The input file accepts both plain-URL lines and **nuclei-style** output lines —
+the first `http(s)` token on each line is used, so nuclei output can be fed
+directly. `-p/--paths` is ignored in this mode (paths come from the spec).
+
+Typical workflow:
+
+```bash
+# 1) discover Swagger UIs with nuclei
+nuclei -l alive_http_services_advanced.txt -t swagger.yaml \
+       -o swagger_endpoints.txt -rl 1000 -c 100
+
+# 2) extract endpoints from the specs and run the checks
+python3 auth_checker.py -f swagger_endpoints.txt --swagger -o results.json
+
+# with all bypass checks too
+python3 auth_checker.py -f swagger_endpoints.txt --swagger --full -o results.json
+```
+
+---
+
 ## `--full`
 
 Enables `--jwt-test`, `--jwt-kid-test`, and `--check-nextjs-cve` at once, plus
@@ -186,6 +224,7 @@ python3 auth_checker.py -f targets.txt --full --proxy-bypass-map map.txt
 |------|-------------|
 | `-f, --file` | **Required.** Targets file (one URL/domain per line). |
 | `-p, --paths` | Paths file; each path is appended to every target (and feeds auto proxy-bypass). |
+| `--swagger` | Treat `-f` as a list of Swagger UI URLs; discover endpoints from the specs and check them (see "Swagger mode" below). |
 | `-t, --timeout` | Per-request timeout in seconds (default `10`). |
 | `-w, --workers` | Parallel threads (default `10`). |
 | `-m, --method` | HTTP method for the baseline: `GET` (default), `HEAD`, `POST`. |
@@ -285,3 +324,15 @@ With `--check-proxy-bypass` — an object with two keys:
   ]
 }
 ```
+
+Each finding keeps only the accepted/meaningful attempts (real PoCs), not the
+rejected negative controls.
+
+---
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No baseline failures. |
+| `2` | At least one baseline target failed (note: a protected endpoint is a "fail" for the baseline, which is the expected/secure outcome). |
