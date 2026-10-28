@@ -327,6 +327,11 @@ Notes:
 
 - Only **findings** are written — cleanly protected endpoints and
   404/network-error results stay in the console log only.
+- An endpoint that is **open without any token** (baseline 200) is recorded as a
+  single `no_auth_required` finding: the JWT and `kid` token batteries are skipped
+  for it (every forged token would be trivially "accepted" because there is no auth
+  to bypass), so you don't get dozens of near-duplicate entries differing only by
+  token `kind`.
 - Writes are **atomic** (temp file + `os.replace`) and **incremental**, so the
   file is always valid JSON and can be tailed while the run is in progress.
 - Format depends on whether proxy-bypass is enabled:
